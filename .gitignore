@@ -1,3 +1,5 @@
 /node_modules
 .env
 front-action.js
+.vercel
+.env*

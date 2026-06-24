@@ -342,7 +342,7 @@ app.get("/admin/analytics", async (req, res) => {
     const paymentsCol = req.db.collection("payments");
 
     const monthlyOrders = await ordersCol.aggregate([
-      { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$_id" } }, count: { $sum: 1 } } },
+      { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, count: { $sum: 1 } } },
       { $sort: { _id: 1 } }
     ]).toArray();
 
@@ -357,7 +357,7 @@ app.get("/admin/analytics", async (req, res) => {
 
     const revenueByMonth = await paymentsCol.aggregate([
       { $match: { paymentStatus: "success" } },
-      { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$_id" } }, revenue: { $sum: "$amount" } } },
+      { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, revenue: { $sum: "$amount" } } },
       { $sort: { _id: 1 } }
     ]).toArray();
 
