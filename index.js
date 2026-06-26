@@ -11,10 +11,10 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 const uri = process.env.MONGODB_URI;
-const url = 
-    process.env.NODE_ENV === "production" ?
-    process.env.CLIENT_URL : 
-    "http://localhost:3000"
+const url =
+  process.env.NODE_ENV === "production"
+    ? process.env.CLIENT_URL
+    : "http://localhost:3000";
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -24,11 +24,7 @@ const client = new MongoClient(uri, {
   },
 });
 
-const JWKS = createRemoteJWKSet(
-  new URL(
-    `${url}/api/auth/jwks`
-  )
-)
+const JWKS = createRemoteJWKSet(new URL(`${url}/api/auth/jwks`));
 
 app.use(
   cors({
@@ -49,16 +45,12 @@ const connectToDB = async () => {
   try {
     // Connect the client to the server	(optional starting in v4.7)
     await client.connect();
-    
+
     cacheDB = await client.db("kino_main");
     return cacheDB;
   } catch (e) {
     console.log("Error connecting to MongoDB", e);
   }
-  //   finally {
-  //     // Ensures that the client will close when you finish/error
-  //     // await client.close();
-  //   }
 };
 
 // Make DB available in all routes easily
@@ -75,32 +67,84 @@ const verifyToken = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader) {
-      return res.status(401).json({ success: false, message: "Unauthorized entry" });
+      return res
+        .status(401)
+        .json({ success: false, message: "Unauthorized entry" });
     }
     const token = authHeader.split(" ")[1];
     try {
       const { payload } = await jwtVerify(token, JWKS);
       req.user = payload;
+      console.log("JWT authenticated:", req.user);
       next();
     } catch (e) {
-      return res.status(403).json({ success: false, message: "Invalid or expired token" });
+      return res
+        .status(403)
+        .json({ success: false, message: "Invalid or expired token" });
     }
   } catch (e) {
-    return res.status(401).json({ success: false, message: "Authentication error" });
+    return res
+      .status(401)
+      .json({ success: false, message: "Authentication error" });
   }
 };
 
 const adminGuard = async (req, res, next) => {
   try {
     if (!req.user || !req.user.email) {
+      return res
+        .status(401)
+        .json({ success: false, message: "Not authenticated" });
+    }
+    const usersCol = req.db.collection("user");
+    const user = await usersCol.findOne({
+      email: req.user.email,
+      role: "admin",
+    });
+    if (!user || user.role.toLowerCase() !== "admin") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Forbidden: Admins only" });
+    }
+    req.dbUser = user;
+    next();
+  } catch (error) {
+    res
+      .status(500)
+      .json({ success: false, message: "Authorization check failed" });
+  }
+};
+
+// Sellers AND admins are allowed
+const sellerGuard = async (req, res, next) => {
+  try {
+    if (!req.user || !req.user.email) {
       return res.status(401).json({ success: false, message: "Not authenticated" });
     }
-    const usersCol = req.db.collection("users");
+    const usersCol = req.db.collection("user");
     const user = await usersCol.findOne({ email: req.user.email });
-
-    if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Forbidden: Admins only" });
+    if (!user || !["seller", "admin"].includes(user.role?.toLowerCase())) {
+      return res.status(403).json({ success: false, message: "Forbidden: Sellers and Admins only" });
     }
+    req.dbUser = user;
+    next();
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Authorization check failed" });
+  }
+};
+
+// Buyers AND admins are allowed
+const buyerGuard = async (req, res, next) => {
+  try {
+    if (!req.user || !req.user.email) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+    const usersCol = req.db.collection("user");
+    const user = await usersCol.findOne({ email: req.user.email });
+    if (!user || !["buyer", "admin"].includes(user.role?.toLowerCase())) {
+      return res.status(403).json({ success: false, message: "Forbidden: Buyers and Admins only" });
+    }
+    req.dbUser = user;
     next();
   } catch (error) {
     res.status(500).json({ success: false, message: "Authorization check failed" });
@@ -124,7 +168,8 @@ app.get("/", (req, res) => {
 app.get("/products", async (req, res) => {
   try {
     const productsCol = req.db.collection("products");
-    const { sort, order, limit, search, category, status, condition } = req.query;
+    const { sort, order, limit, search, category, status, condition } =
+      req.query;
 
     const filter = {};
     if (search) filter.title = { $regex: search, $options: "i" }; // Fixed: was filter.name
@@ -141,7 +186,11 @@ app.get("/products", async (req, res) => {
 
     const limitNum = limit ? parseInt(limit, 10) : 10;
 
-    const result = await productsCol.find(filter).limit(limitNum).sort(sortObj).toArray();
+    const result = await productsCol
+      .find(filter)
+      .limit(limitNum)
+      .sort(sortObj)
+      .toArray();
 
     res.status(200).json({
       success: true,
@@ -150,7 +199,9 @@ app.get("/products", async (req, res) => {
     });
   } catch (e) {
     console.error("Load products error:", e);
-    res.status(500).json({ success: false, message: "Failed to load products" });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to load products" });
   }
 });
 
@@ -161,8 +212,13 @@ app.get("/products/:id", async (req, res) => {
     // Fixed: Searching by _id ObjectId instead of string id
     const result = await productsCol.findOne({ _id: new ObjectId(id) });
 
-    if (!result) return res.status(404).json({ success: false, message: "Product not found" });
-    res.status(200).json({ success: true, message: "Product info loaded", result });
+    if (!result)
+      return res
+        .status(404)
+        .json({ success: false, message: "Product not found" });
+    res
+      .status(200)
+      .json({ success: true, message: "Product info loaded", result });
   } catch (e) {
     res.status(500).json({ success: false, message: "Failed to load product" });
   }
@@ -175,10 +231,258 @@ app.get("/products/:id", async (req, res) => {
 // All /admin routes require valid token AND admin role
 app.use("/admin", verifyToken, adminGuard);
 
+// --- USERS ---
+app.get("/admin/users", async (req, res) => {
+  try {
+    const usersCol = req.db.collection("user");
+    const { search, role, sort, order, status } = req.query;
+    const { skip, limit } = parsePagination(req.query);
+
+    const filter = {};
+    if (search) filter.name = { $regex: search, $options: "i" };
+    if (role) filter.role = role;
+    if (status) filter.status = status;
+
+    const sortObj = {};
+    if (sort) sortObj[sort] = order === "desc" ? -1 : 1;
+    else sortObj.createdAt = -1;
+
+    const result = await usersCol
+      .find(filter)
+      .sort(sortObj)
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+    const total = await usersCol.countDocuments(filter);
+
+    res.status(200).json({ success: true, result, total });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch users" });
+  }
+});
+
+app.patch("/admin/users/:userId/status", async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!status)
+      return res
+        .status(400)
+        .json({ success: false, message: "Status is required" });
+
+    const result = await req.db
+      .collection("user")
+      .updateOne(
+        { _id: new ObjectId(req.params.userId) },
+        { $set: { status } },
+      );
+    res
+      .status(200)
+      .json({ success: true, message: "User status updated", result });
+  } catch (e) {
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update user status" });
+  }
+});
+
+app.delete("/admin/users/:userId", async (req, res) => {
+  try {
+    await req.db
+      .collection("user")
+      .deleteOne({ _id: new ObjectId(req.params.userId) });
+    res
+      .status(200)
+      .json({ success: true, message: "User deleted", result: null });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to delete user" });
+  }
+});
+
+// --- PRODUCTS ---
+app.get("/admin/products", async (req, res) => {
+  try {
+    const productsCol = req.db.collection("products");
+    const { search, category, status } = req.query;
+    const { skip, limit } = parsePagination(req.query);
+
+    const filter = {};
+    if (search) filter.title = { $regex: search, $options: "i" };
+    if (category) filter.category = category;
+    if (status) filter.status = status;
+
+    const result = await productsCol
+      .find(filter)
+      .sort({ _id: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+    const total = await productsCol.countDocuments(filter);
+
+    res.status(200).json({ success: true, result, total });
+  } catch (e) {
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch products" });
+  }
+});
+
+app.patch("/admin/products/:productId/status", async (req, res) => {
+  try {
+    const { status } = req.body;
+    const result = await req.db
+      .collection("products")
+      .updateOne(
+        { _id: new ObjectId(req.params.productId) },
+        { $set: { status } },
+      );
+    res
+      .status(200)
+      .json({ success: true, message: "Product status updated", result });
+  } catch (e) {
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update product status" });
+  }
+});
+
+app.delete("/admin/products/:productId", async (req, res) => {
+  try {
+    await req.db
+      .collection("products")
+      .deleteOne({ _id: new ObjectId(req.params.productId) });
+    res
+      .status(200)
+      .json({ success: true, message: "Product deleted", result: null });
+  } catch (e) {
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to delete product" });
+  }
+});
+
+// --- ORDERS ---
+app.get("/admin/orders", async (req, res) => {
+  try {
+    const ordersCol = req.db.collection("orders");
+    const { search, status } = req.query;
+    const { skip, limit } = parsePagination(req.query);
+
+    const filter = {};
+    if (status) filter.orderStatus = status;
+    if (search) {
+      filter.$or = [
+        { "buyerInfo.name": { $regex: search, $options: "i" } },
+        { "buyerInfo.email": { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const result = await ordersCol
+      .find(filter)
+      .sort({ _id: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+    const total = await ordersCol.countDocuments(filter);
+
+    res.status(200).json({ success: true, result, total });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch orders" });
+  }
+});
+
+app.patch("/admin/orders/:orderId/status", async (req, res) => {
+  try {
+    const { status } = req.body;
+    const result = await req.db
+      .collection("orders")
+      .updateOne(
+        { _id: new ObjectId(req.params.orderId) },
+        { $set: { orderStatus: status } },
+      );
+    res
+      .status(200)
+      .json({ success: true, message: "Order status updated", result });
+  } catch (e) {
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update order status" });
+  }
+});
+
+// --- ANALYTICS ---
+app.get("/admin/analytics", async (req, res) => {
+  try {
+    const ordersCol = req.db.collection("orders");
+    const productsCol = req.db.collection("products");
+    const usersCol = req.db.collection("user");
+    const paymentsCol = req.db.collection("payments");
+
+    const monthlyOrders = await ordersCol
+      .aggregate([
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ])
+      .toArray();
+
+    const categoryPerformance = await productsCol
+      .aggregate([
+        { $group: { _id: "$category", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ])
+      .toArray();
+
+    const userGrowth = await usersCol
+      .aggregate([{ $group: { _id: "$role", count: { $sum: 1 } } }])
+      .toArray();
+
+    const revenueByMonth = await paymentsCol
+      .aggregate([
+        { $match: { paymentStatus: "success" } },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+            revenue: { $sum: "$amount" },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ])
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      result: {
+        monthlyOrders: monthlyOrders.map((m) => ({
+          month: m._id,
+          count: m.count,
+        })),
+        categoryPerformance: categoryPerformance.map((c) => ({
+          category: c._id,
+          count: c.count,
+        })),
+        userGrowth: userGrowth.map((u) => ({ role: u._id, count: u.count })),
+        revenueByMonth: revenueByMonth.map((r) => ({
+          month: r._id,
+          revenue: r.revenue,
+        })),
+      },
+    });
+  } catch (e) {
+    console.error("Analytics error:", e);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to load analytics" });
+  }
+});
+
 // --- STATS ---
 app.get("/admin/stats/users", async (req, res) => {
   try {
-    const total = await req.db.collection("users").countDocuments();
+    const total = await req.db.collection("user").countDocuments();
     res.status(200).json({ success: true, result: { total } });
   } catch (e) {
     res.status(500).json({ success: false, message: "Failed to fetch stats" });
@@ -203,63 +507,111 @@ app.get("/admin/stats/orders", async (req, res) => {
   }
 });
 
-// --- USERS ---
-app.get("/admin/users", async (req, res) => {
+app.get("/admin/stats/revenue", async (req, res) => {
   try {
-    const usersCol = req.db.collection("users");
-    const { search, role, sort, order, status } = req.query;
-    const { skip, limit } = parsePagination(req.query);
+    const totalRevenueData = await req.db
+      .collection("payments")
+      .aggregate([
+        { $match: { paymentStatus: "success" } },
+        { $group: { _id: null, totalRevenue: { $sum: "$amount" } } },
+      ])
+      .toArray();
 
-    const filter = {};
-    if (search) filter.name = { $regex: search, $options: "i" };
-    if (role) filter.role = role;
-    if (status) filter.status = status;
-
-    const sortObj = {};
-    if (sort) sortObj[sort] = order === "desc" ? -1 : 1;
-    else sortObj.createdAt = -1;
-
-    const result = await usersCol.find(filter).sort(sortObj).skip(skip).limit(limit).toArray();
-    const total = await usersCol.countDocuments(filter);
-
-    res.status(200).json({ success: true, result, total });
+    const totalRevenue =
+      totalRevenueData.length > 0 ? totalRevenueData[0].totalRevenue : 0;
+    res.status(200).json({ success: true, result: { totalRevenue } });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch users" });
+    res.status(500).json({ success: false, message: "Failed to fetch stats" });
   }
 });
 
-app.patch("/admin/users/:userId/status", async (req, res) => {
+app.get("/admin/stats/revenue-by-month", async (req, res) => {
   try {
-    const { status } = req.body;
-    if (!status) return res.status(400).json({ success: false, message: "Status is required" });
+    const revenueByMonth = await req.db.collection("payments");
+    const revenueData = await revenueByMonth
+      .aggregate([
+        { $match: { paymentStatus: "success" } },
+        {
+          $group: {
+            _id: { $month: "$createdAt" },
+            revenue: { $sum: "$amount" },
+          },
+        },
+      ])
+      .toArray();
 
-    const result = await req.db.collection("users").updateOne(
-      { _id: new ObjectId(req.params.userId) },
-      { $set: { status } }
-    );
-    res.status(200).json({ success: true, message: "User status updated", result });
+    res
+      .status(200)
+      .json({ success: true, result: { revenueByMonth: revenueData } });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update user status" });
+    res.status(500).json({ success: false, message: "Failed to fetch stats" });
   }
 });
 
-app.delete("/admin/users/:userId", async (req, res) => {
+app.get("/admin/analytics/summary", async (req, res) => {
   try {
-    await req.db.collection("users").deleteOne({ _id: new ObjectId(req.params.userId) });
-    res.status(200).json({ success: true, message: "User deleted", result: null });
+    const ordersCol = req.db.collection("orders");
+    const productsCol = req.db.collection("products");
+    const usersCol = req.db.collection("user");
+    const paymentsCol = req.db.collection("payments");
+
+    const totalOrders = await ordersCol.countDocuments();
+    const totalProducts = await productsCol.countDocuments();
+    const totalUsers = await usersCol.countDocuments();
+    const totalRevenueData = await paymentsCol
+      .aggregate([
+        {
+          $match: {
+            paymentStatus: "success",
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalRevenue: {
+              $sum: "$amount",
+            },
+          },
+        },
+      ])
+      .toArray();
+
+    console.log("Total revenue data:", totalRevenueData); // Debugging line
+    const totalRevenue =
+      totalRevenueData.length > 0 ? totalRevenueData[0].totalRevenue : 0;
+
+    res.status(200).json({
+      success: true,
+      result: {
+        totalOrders,
+        totalProducts,
+        totalUsers,
+        totalRevenue,
+      },
+    });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to delete user" });
+    console.error("Analytics summary error:", e);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to load analytics summary" });
   }
 });
 
-// --- PRODUCTS ---
-app.get("/admin/products", async (req, res) => {
+// ==========================================
+// SELLER PROTECTED ROUTES  (seller | admin)
+// ==========================================
+
+app.use("/seller", verifyToken, sellerGuard);
+
+// --- SELLER PRODUCTS ---
+
+app.get("/seller/products", async (req, res) => {
   try {
     const productsCol = req.db.collection("products");
     const { search, category, status } = req.query;
     const { skip, limit } = parsePagination(req.query);
 
-    const filter = {};
+    const filter = { sellerEmail: req.user.email };
     if (search) filter.title = { $regex: search, $options: "i" };
     if (category) filter.category = category;
     if (status) filter.status = status;
@@ -269,45 +621,72 @@ app.get("/admin/products", async (req, res) => {
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch products" });
+    res.status(500).json({ success: false, message: "Failed to fetch seller products" });
   }
 });
 
-app.patch("/admin/products/:productId/status", async (req, res) => {
+app.post("/seller/products", async (req, res) => {
   try {
-    const { status } = req.body;
-    const result = await req.db.collection("products").updateOne(
-      { _id: new ObjectId(req.params.productId) },
-      { $set: { status } }
-    );
-    res.status(200).json({ success: true, message: "Product status updated", result });
+    const productsCol = req.db.collection("products");
+    const product = {
+      ...req.body,
+      sellerEmail: req.user.email,
+      sellerName: req.dbUser.name || "",
+      status: "available",
+      dateUploaded: new Date(),
+      createdAt: new Date(),
+    };
+    const result = await productsCol.insertOne(product);
+    res.status(201).json({ success: true, message: "Product created", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update product status" });
+    res.status(500).json({ success: false, message: "Failed to create product" });
   }
 });
 
-app.delete("/admin/products/:productId", async (req, res) => {
+// Ownership check — seller can only update their own product
+app.patch("/seller/products/:id", async (req, res) => {
   try {
-    await req.db.collection("products").deleteOne({ _id: new ObjectId(req.params.productId) });
+    const productsCol = req.db.collection("products");
+    const filter = { _id: new ObjectId(req.params.id), sellerEmail: req.user.email };
+    const result = await productsCol.updateOne(filter, { $set: { ...req.body, updatedAt: new Date() } });
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Product not found or not yours" });
+    }
+    res.status(200).json({ success: true, message: "Product updated", result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to update product" });
+  }
+});
+
+// Ownership check — seller can only delete their own product
+app.delete("/seller/products/:id", async (req, res) => {
+  try {
+    const productsCol = req.db.collection("products");
+    const filter = { _id: new ObjectId(req.params.id), sellerEmail: req.user.email };
+    const result = await productsCol.deleteOne(filter);
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Product not found or not yours" });
+    }
     res.status(200).json({ success: true, message: "Product deleted", result: null });
   } catch (e) {
     res.status(500).json({ success: false, message: "Failed to delete product" });
   }
 });
 
-// --- ORDERS ---
-app.get("/admin/orders", async (req, res) => {
+// --- SELLER ORDERS ---
+
+app.get("/seller/orders", async (req, res) => {
   try {
     const ordersCol = req.db.collection("orders");
     const { search, status } = req.query;
     const { skip, limit } = parsePagination(req.query);
 
-    const filter = {};
-    if (status) filter.orderStatus = status; 
+    const filter = { sellerEmail: req.user.email };
+    if (status) filter.orderStatus = status;
     if (search) {
       filter.$or = [
         { "buyerInfo.name": { $regex: search, $options: "i" } },
-        { "buyerInfo.email": { $regex: search, $options: "i" } }
+        { "buyerInfo.email": { $regex: search, $options: "i" } },
       ];
     }
 
@@ -316,63 +695,271 @@ app.get("/admin/orders", async (req, res) => {
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch orders" });
+    res.status(500).json({ success: false, message: "Failed to fetch seller orders" });
   }
 });
 
-app.patch("/admin/orders/:orderId/status", async (req, res) => {
+app.patch("/seller/orders/:id/status", async (req, res) => {
   try {
     const { status } = req.body;
-    const result = await req.db.collection("orders").updateOne(
-      { _id: new ObjectId(req.params.orderId) },
-      { $set: { orderStatus: status } }
-    );
+    if (!status) {
+      return res.status(400).json({ success: false, message: "Status is required" });
+    }
+    const ordersCol = req.db.collection("orders");
+    const filter = { _id: new ObjectId(req.params.id), sellerEmail: req.user.email };
+    const result = await ordersCol.updateOne(filter, { $set: { orderStatus: status, updatedAt: new Date() } });
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Order not found or not yours" });
+    }
     res.status(200).json({ success: true, message: "Order status updated", result });
   } catch (e) {
     res.status(500).json({ success: false, message: "Failed to update order status" });
   }
 });
 
-// --- ANALYTICS ---
-app.get("/admin/analytics", async (req, res) => {
+// --- SELLER STATS ---
+
+app.get("/seller/stats", async (req, res) => {
+  try {
+    const productsCol = req.db.collection("products");
+    const ordersCol = req.db.collection("orders");
+    const paymentsCol = req.db.collection("payments");
+
+    const totalProducts = await productsCol.countDocuments({ sellerEmail: req.user.email });
+    const totalOrders = await ordersCol.countDocuments({ sellerEmail: req.user.email });
+    const pendingOrders = await ordersCol.countDocuments({ sellerEmail: req.user.email, orderStatus: "pending" });
+
+    const revenueData = await paymentsCol.aggregate([
+      { $match: { sellerEmail: req.user.email, paymentStatus: "success" } },
+      { $group: { _id: null, totalRevenue: { $sum: "$amount" } } },
+    ]).toArray();
+    const totalRevenue = revenueData.length > 0 ? revenueData[0].totalRevenue : 0;
+
+    res.status(200).json({
+      success: true,
+      result: { totalProducts, totalOrders, totalRevenue, pendingOrders },
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch seller stats" });
+  }
+});
+
+// --- SELLER ANALYTICS ---
+
+app.get("/seller/analytics", async (req, res) => {
   try {
     const ordersCol = req.db.collection("orders");
     const productsCol = req.db.collection("products");
-    const usersCol = req.db.collection("users");
-    const paymentsCol = req.db.collection("payments");
 
-    const monthlyOrders = await ordersCol.aggregate([
-      { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, count: { $sum: 1 } } },
-      { $sort: { _id: 1 } }
+    const monthlySales = await ordersCol.aggregate([
+      { $match: { sellerEmail: req.user.email } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+          count: { $sum: 1 },
+          revenue: { $sum: "$totalAmount" },
+        },
+      },
+      { $sort: { _id: 1 } },
     ]).toArray();
 
-    const categoryPerformance = await productsCol.aggregate([
-      { $group: { _id: "$category", count: { $sum: 1 } } },
-      { $sort: { count: -1 } }
-    ]).toArray();
-
-    const userGrowth = await usersCol.aggregate([
-      { $group: { _id: "$role", count: { $sum: 1 } } }
-    ]).toArray();
-
-    const revenueByMonth = await paymentsCol.aggregate([
-      { $match: { paymentStatus: "success" } },
-      { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, revenue: { $sum: "$amount" } } },
-      { $sort: { _id: 1 } }
-    ]).toArray();
+    const topProducts = await productsCol
+      .find({ sellerEmail: req.user.email })
+      .sort({ soldCount: -1 })
+      .limit(5)
+      .toArray();
 
     res.status(200).json({
       success: true,
       result: {
-        monthlyOrders: monthlyOrders.map(m => ({ month: m._id, count: m.count })),
-        categoryPerformance: categoryPerformance.map(c => ({ category: c._id, count: c.count })),
-        userGrowth: userGrowth.map(u => ({ month: u._id, count: u.count })),
-        revenueByMonth: revenueByMonth.map(r => ({ month: r._id, revenue: r.revenue }))
-      }
+        monthlySales: monthlySales.map((m) => ({ month: m._id, count: m.count, revenue: m.revenue })),
+        topProducts,
+      },
     });
   } catch (e) {
-    console.error("Analytics error:", e);
-    res.status(500).json({ success: false, message: "Failed to load analytics" });
+    res.status(500).json({ success: false, message: "Failed to fetch seller analytics" });
+  }
+});
+
+// ==========================================
+// BUYER PROTECTED ROUTES  (buyer | admin)
+// ==========================================
+
+app.use("/buyer", verifyToken, buyerGuard);
+
+// --- BUYER ORDERS ---
+
+app.get("/buyer/orders", async (req, res) => {
+  try {
+    const ordersCol = req.db.collection("orders");
+    const { status } = req.query;
+    const { skip, limit } = parsePagination(req.query);
+
+    const filter = { "buyerInfo.email": req.user.email };
+    if (status) filter.orderStatus = status;
+
+    const result = await ordersCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
+    const total = await ordersCol.countDocuments(filter);
+
+    res.status(200).json({ success: true, result, total });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch buyer orders" });
+  }
+});
+
+// Only pending orders can be cancelled
+app.patch("/buyer/orders/:id/cancel", async (req, res) => {
+  try {
+    const ordersCol = req.db.collection("orders");
+    const filter = {
+      _id: new ObjectId(req.params.id),
+      "buyerInfo.email": req.user.email,
+      orderStatus: "pending",
+    };
+    const result = await ordersCol.updateOne(filter, {
+      $set: { orderStatus: "cancelled", updatedAt: new Date() },
+    });
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Order not found or cannot be cancelled" });
+    }
+    res.status(200).json({ success: true, message: "Order cancelled", result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to cancel order" });
+  }
+});
+
+// --- BUYER STATS ---
+
+app.get("/buyer/stats", async (req, res) => {
+  try {
+    const ordersCol = req.db.collection("orders");
+    const usersCol = req.db.collection("user");
+
+    const totalOrders = await ordersCol.countDocuments({ "buyerInfo.email": req.user.email });
+
+    const user = await usersCol.findOne({ email: req.user.email });
+    const wishlistCount = user?.wishlist?.length || 0;
+
+    const recentPurchases = await ordersCol
+      .find({ "buyerInfo.email": req.user.email, orderStatus: "delivered" })
+      .sort({ _id: -1 })
+      .limit(5)
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      result: { totalOrders, wishlistCount, recentPurchases },
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch buyer stats" });
+  }
+});
+
+// ==========================================
+// WISHLIST ROUTES  (any authenticated user)
+// ==========================================
+
+app.get("/wishlist", verifyToken, async (req, res) => {
+  try {
+    const usersCol = req.db.collection("user");
+    const productsCol = req.db.collection("products");
+
+    const user = await usersCol.findOne({ email: req.user.email });
+    const wishlist = user?.wishlist || [];
+
+    if (wishlist.length === 0) {
+      return res.status(200).json({ success: true, result: [] });
+    }
+
+    const objectIds = wishlist.map((id) => new ObjectId(id));
+    const result = await productsCol.find({ _id: { $in: objectIds } }).toArray();
+
+    res.status(200).json({ success: true, result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch wishlist" });
+  }
+});
+
+app.post("/wishlist/:productId", verifyToken, async (req, res) => {
+  try {
+    const usersCol = req.db.collection("user");
+    await usersCol.updateOne(
+      { email: req.user.email },
+      { $addToSet: { wishlist: req.params.productId } },
+    );
+    res.status(200).json({ success: true, message: "Added to wishlist", result: null });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to update wishlist" });
+  }
+});
+
+app.delete("/wishlist/:productId", verifyToken, async (req, res) => {
+  try {
+    const usersCol = req.db.collection("user");
+    await usersCol.updateOne(
+      { email: req.user.email },
+      { $pull: { wishlist: req.params.productId } },
+    );
+    res.status(200).json({ success: true, message: "Removed from wishlist", result: null });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to update wishlist" });
+  }
+});
+
+// ==========================================
+// PROFILE ROUTES  (any authenticated user)
+// ==========================================
+
+app.get("/profile", verifyToken, async (req, res) => {
+  try {
+    const usersCol = req.db.collection("user");
+    const user = await usersCol.findOne({ email: req.user.email });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+    const { password, ...profile } = user;
+    res.status(200).json({ success: true, result: profile });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch profile" });
+  }
+});
+
+app.patch("/profile", verifyToken, async (req, res) => {
+  try {
+    const usersCol = req.db.collection("user");
+    const { name, phone, location, image } = req.body;
+    const update = { updatedAt: new Date() };
+    if (name !== undefined) update.name = name;
+    if (phone !== undefined) update.phone = phone;
+    if (location !== undefined) update.location = location;
+    if (image !== undefined) update.image = image;
+
+    const result = await usersCol.updateOne({ email: req.user.email }, { $set: update });
+    res.status(200).json({ success: true, message: "Profile updated", result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to update profile" });
+  }
+});
+
+// ==========================================
+// PAYMENTS ROUTES  (buyer | admin)
+// ==========================================
+
+app.get("/payments/my-history", verifyToken, buyerGuard, async (req, res) => {
+  try {
+    const paymentsCol = req.db.collection("payments");
+    const { status } = req.query;
+    const { skip, limit } = parsePagination(req.query);
+
+    const filter = { buyerEmail: req.user.email };
+    if (status) filter.paymentStatus = status;
+
+    const result = await paymentsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
+    const total = await paymentsCol.countDocuments(filter);
+
+    res.status(200).json({ success: true, result, total });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch payment history" });
   }
 });
 
