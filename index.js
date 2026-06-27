@@ -6,6 +6,7 @@ import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { v2 as cloudinary } from "cloudinary";
 import crypto from "crypto";
+import Stripe from "stripe";
 
 dotenv.config();
 
@@ -45,6 +46,8 @@ app.use(
   }),
 );
 app.use(express.json());
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 let cacheDB = null;
 
