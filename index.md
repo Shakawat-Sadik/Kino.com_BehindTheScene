@@ -9,7 +9,7 @@ Base URL: `/`
 ### Health & Status
 | Method | Endpoint | Description | Middleware |
 |--------|----------|-------------|------------|
-| `GET`  | `/` | Server health check | None |
+| `GET`  |    `/`   | Server health check | None |
 
 **Response:**
 ```json

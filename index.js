@@ -1,11 +1,20 @@
-//pnpm add express mongodb jose cors dotenv
+//pnpm add express mongodb jose cors dotenv cloudinary
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { v2 as cloudinary } from "cloudinary";
+import crypto from "crypto";
 
 dotenv.config();
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -239,7 +248,12 @@ app.get("/admin/users", async (req, res) => {
     const { skip, limit } = parsePagination(req.query);
 
     const filter = {};
-    if (search) filter.name = { $regex: search, $options: "i" };
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } },
+      ];
+    }
     if (role) filter.role = role;
     if (status) filter.status = status;
 
@@ -285,6 +299,24 @@ app.patch("/admin/users/:userId/status", async (req, res) => {
   }
 });
 
+app.patch("/admin/users/:userId", async (req, res) => {
+  try {
+    const { name, role, location, contact } = req.body;
+    const update = { updatedAt: new Date() };
+    if (name !== undefined) update.name = name;
+    if (role !== undefined) update.role = role;
+    if (location !== undefined) update.location = location;
+    if (contact !== undefined) update.contact = contact;
+
+    const result = await req.db
+      .collection("user")
+      .updateOne({ _id: new ObjectId(req.params.userId) }, { $set: update });
+    res.status(200).json({ success: true, message: "User updated", result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to update user" });
+  }
+});
+
 app.delete("/admin/users/:userId", async (req, res) => {
   try {
     await req.db
@@ -323,6 +355,25 @@ app.get("/admin/products", async (req, res) => {
     res
       .status(500)
       .json({ success: false, message: "Failed to fetch products" });
+  }
+});
+
+app.patch("/admin/products/:productId", async (req, res) => {
+  try {
+    const { title, category, condition, price, description } = req.body;
+    const update = { updatedAt: new Date() };
+    if (title !== undefined) update.title = title;
+    if (category !== undefined) update.category = category;
+    if (condition !== undefined) update.condition = condition;
+    if (price !== undefined) update.price = Number(price);
+    if (description !== undefined) update.description = description;
+
+    const result = await req.db
+      .collection("products")
+      .updateOne({ _id: new ObjectId(req.params.productId) }, { $set: update });
+    res.status(200).json({ success: true, message: "Product updated", result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to update product" });
   }
 });
 
@@ -445,7 +496,7 @@ app.get("/admin/analytics", async (req, res) => {
         { $match: { paymentStatus: "success" } },
         {
           $group: {
-            _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
+            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
             revenue: { $sum: "$amount" },
           },
         },
@@ -475,7 +526,7 @@ app.get("/admin/analytics", async (req, res) => {
     console.error("Analytics error:", e);
     res
       .status(500)
-      .json({ success: false, message: "Failed to load analytics" });
+      .json({ success: false, message: e.message, details: e.stack, cause: e.cause, name: e.name, code: e.code, info: e.info });
   }
 });
 
@@ -751,13 +802,15 @@ app.get("/seller/analytics", async (req, res) => {
     const ordersCol = req.db.collection("orders");
     const productsCol = req.db.collection("products");
 
+    // Orders have no amount field — revenue comes from the payments collection.
+    // Joining here via $lookup on orderId would require string-to-ObjectId coercion;
+    // totalRevenue is already available via /seller/stats so we omit it here.
     const monthlySales = await ordersCol.aggregate([
       { $match: { sellerEmail: req.user.email } },
       {
         $group: {
           _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
           count: { $sum: 1 },
-          revenue: { $sum: "$totalAmount" },
         },
       },
       { $sort: { _id: 1 } },
@@ -772,7 +825,7 @@ app.get("/seller/analytics", async (req, res) => {
     res.status(200).json({
       success: true,
       result: {
-        monthlySales: monthlySales.map((m) => ({ month: m._id, count: m.count, revenue: m.revenue })),
+        monthlySales: monthlySales.map((m) => ({ month: m._id, count: m.count })),
         topProducts,
       },
     });
@@ -927,10 +980,10 @@ app.get("/profile", verifyToken, async (req, res) => {
 app.patch("/profile", verifyToken, async (req, res) => {
   try {
     const usersCol = req.db.collection("user");
-    const { name, phone, location, image } = req.body;
+    const { name, contact, location, image } = req.body;
     const update = { updatedAt: new Date() };
     if (name !== undefined) update.name = name;
-    if (phone !== undefined) update.phone = phone;
+    if (contact !== undefined) update.contact = contact;
     if (location !== undefined) update.location = location;
     if (image !== undefined) update.image = image;
 
@@ -964,6 +1017,109 @@ app.get("/payments/my-history", verifyToken, buyerGuard, async (req, res) => {
 });
 
 // ==========================================
+// UPLOAD ROUTES  (any authenticated user)
+// ==========================================
+
+// POST /upload — receives raw binary body, deduplicates via SHA-256, uploads to Cloudinary
+app.post("/upload", verifyToken, async (req, res) => {
+  try {
+    const mimeType = req.headers["content-type"] || "image/jpeg";
+    const folder = req.headers["x-upload-folder"] || "Kino.com";
+    const fileName = req.headers["x-upload-filename"] || "upload";
+
+    // Collect raw binary stream — works because express.json() ignores non-JSON content-types
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+
+    if (!buffer.length) {
+      return res.status(400).json({ success: false, message: "No file data received" });
+    }
+
+    // SHA-256 deduplication check
+    const hash = crypto.createHash("sha256").update(buffer).digest("hex");
+    const uploadsCol = req.db.collection("cloudinary_uploads");
+
+    const existing = await uploadsCol.findOne({ hash });
+    if (existing) {
+      return res.status(200).json({
+        success: true,
+        result: { url: existing.url, public_id: existing.public_id, isDuplicate: true },
+      });
+    }
+
+    // Upload to Cloudinary as base64 data URI
+    const dataUri = `data:${mimeType};base64,${buffer.toString("base64")}`;
+    const result = await cloudinary.uploader.upload(dataUri, {
+      folder,
+      resource_type: "image",
+      transformation: [
+        { width: 1200, height: 900, crop: "limit" },
+        { quality: "auto" },
+        { fetch_format: "auto" },
+      ],
+    });
+
+    // Persist upload record for deduplication and ownership tracking
+    try {
+      await uploadsCol.insertOne({
+        hash,
+        fileName,
+        fileSize: buffer.length,
+        mimeType,
+        public_id: result.public_id,
+        url: result.secure_url,
+        folder: result.folder,
+        uploadedBy: req.user.email,
+        createdAt: new Date(),
+      });
+    } catch (e) {
+      if (e.code === 11000) {
+        // Race condition: another identical upload completed first
+        const winner = await uploadsCol.findOne({ hash });
+        return res.status(200).json({
+          success: true,
+          result: { url: winner.url, public_id: winner.public_id, isDuplicate: true },
+        });
+      }
+      throw e;
+    }
+
+    return res.status(200).json({
+      success: true,
+      result: { url: result.secure_url, public_id: result.public_id, isDuplicate: false },
+    });
+  } catch (e) {
+    console.error("Upload error:", e);
+    return res.status(500).json({ success: false, message: "Upload failed" });
+  }
+});
+
+// DELETE /upload/*publicId — publicId may contain slashes (e.g. Kino.com/products/abc123)
+app.delete("/upload/*publicId", verifyToken, async (req, res) => {
+  try {
+    const publicId = req.params.publicId;
+    const uploadsCol = req.db.collection("cloudinary_uploads");
+
+    const record = await uploadsCol.findOne({ public_id: publicId });
+    if (!record) {
+      return res.status(404).json({ success: false, message: "Image not found" });
+    }
+    if (record.uploadedBy !== req.user.email) {
+      return res.status(403).json({ success: false, message: "Forbidden" });
+    }
+
+    await cloudinary.uploader.destroy(publicId);
+    await uploadsCol.deleteOne({ public_id: publicId });
+
+    return res.status(200).json({ success: true, message: "Image deleted" });
+  } catch (e) {
+    console.error("Delete error:", e);
+    return res.status(500).json({ success: false, message: "Delete failed" });
+  }
+});
+
+// ==========================================
 // SERVER INITIALIZATION
 // ==========================================
 
@@ -977,7 +1133,7 @@ if (process.env.NODE_ENV !== "production") {
 export default app;
 
 /*
-Vercel initiates a serverless container. This containers code reading flow goes one way, doesn't wait for a nested awaited route definition or nested await functions inside the body of `run` function to return a result, and as soon as the code is read to the end, the undiscovered result remains as null, the code reading finishes and the container shuts down completely. For example: when I'm requesting the "/doctors" url, the run function is busy connecting to the server instance to mongodb. So the request hits the wall, and all the routes remain unregistered, with an unsuccessful 404 code. As soon as the awaited connection is established, the one way code reading flow dashes through all those 404s and reach to the end of code. The containers job is to return with HTTP responses and as much data it can gather meanwhile. Well, because of seeing 404s on every endpoint, the return appears to the end user empty handed.
+Vercel initiates a serverless container. This containers code reading flow goes one way, doesn't wait for a nested awaited route definition or nested await functions inside the body of `run` function to return a result, and as soon as the code is read to the end, the undiscovered result remains null. The code reading finishes and the container shuts down completely. For example: when I'm requesting the "/doctors" url, the run function is busy connecting to the server instance to mongodb. So the request hits the wall, and all the routes remain unregistered, with an unsuccessful 404 code. As soon as the awaited connection is established, the one way code reading flow dashes through all those 404s and reach to the end of code. The containers job is to return with HTTP responses and as much data it can gather meanwhile. Well, because of seeing 404s on every endpoint, the return appears to the end user empty handed.
 
 So all the route definition codes inside the `run` function has to come to the root/module level.
 No need to confuse the route endpoints with any other asynchronous functions btw.
