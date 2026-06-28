@@ -81,7 +81,7 @@ app.use(async (req, res, next) => {
   } catch (e) {
     res.status(503).json({ success: false, message: "Database unavailable" });
   }
-
+});
 // ==========================================
 // MIDDLEWARE
 // ==========================================
@@ -248,6 +248,107 @@ app.get("/products/:id", async (req, res) => {
   }
 });
 
+app.get("/stats", async (req, res) => {
+  try {
+    const productsCol = req.db.collection("products");
+    const usersCol = req.db.collection("user");
+    const ordersCol = req.db.collection("orders");
+
+    const [totalProducts, totalSellers, totalBuyers, totalOrders] = await Promise.all([
+      productsCol.countDocuments({ status: "available" }),
+      usersCol.countDocuments({ role: "seller" }),
+      usersCol.countDocuments({ role: "buyer" }),
+      ordersCol.countDocuments({ orderStatus: "delivered" }),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      result: { totalProducts, totalSellers, totalBuyers, totalOrders },
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch stats" });
+  }
+});
+
+// ==========================================
+// SELLERS — PUBLIC TOP SELLERS
+// ==========================================
+
+app.get("/sellers/top", async (req, res) => {
+  try {
+    const productsCol = req.db.collection("products");
+    const usersCol = req.db.collection("user");
+    const limit = Math.min(parseInt(req.query.limit) || 3, 10);
+
+    const topSellers = await productsCol
+      .aggregate([
+        { $match: { status: "available" } },
+        {
+          $group: {
+            _id: "$sellerInfo.userId",
+            productCount: { $sum: 1 },
+            sellerInfo: { $first: "$sellerInfo" },
+          },
+        },
+        { $sort: { productCount: -1 } },
+        { $limit: limit },
+      ])
+      .toArray();
+
+    const enriched = await Promise.all(
+      topSellers.map(async (s) => {
+        let user = null;
+        try {
+          user = await usersCol.findOne({ _id: new ObjectId(s._id) });
+        } catch {}
+        return {
+          _id: s._id,
+          name: user?.name || s.sellerInfo?.name || "Seller",
+          location: user?.location || {},
+          productCount: s.productCount,
+          image: user?.image || null,
+        };
+      })
+    );
+
+    res.status(200).json({ success: true, result: enriched });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch top sellers" });
+  }
+});
+
+// ==========================================
+// REVIEWS — PUBLIC READ
+// ==========================================
+
+app.get("/reviews", async (req, res) => {
+  try {
+    const reviewsCol = req.db.collection("reviews");
+    const limit = Math.min(parseInt(req.query.limit) || 6, 20);
+    const result = await reviewsCol
+      .find({ rating: { $gte: 4 } })
+      .sort({ _id: -1 })
+      .limit(limit)
+      .toArray();
+    res.status(200).json({ success: true, result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch reviews" });
+  }
+});
+
+app.get("/reviews/:productId", async (req, res) => {
+  try {
+    const reviewsCol = req.db.collection("reviews");
+    const result = await reviewsCol
+      .find({ productId: req.params.productId })
+      .sort({ _id: -1 })
+      .toArray();
+    res.status(200).json({ success: true, result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch reviews" });
+  }
+});
+
 // ==========================================
 // ADMIN PROTECTED ROUTES
 // ==========================================
@@ -395,6 +496,8 @@ app.patch("/admin/products/:productId", async (req, res) => {
 app.patch("/admin/products/:productId/status", async (req, res) => {
   try {
     const { status } = req.body;
+    if (!status)
+      return res.status(400).json({ success: false, message: "Status is required" });
     const result = await req.db
       .collection("products")
       .updateOne(
@@ -475,6 +578,31 @@ app.patch("/admin/orders/:orderId/status", async (req, res) => {
   }
 });
 
+// --- PAYMENTS (Admin monitoring) ---
+app.get("/admin/payments", async (req, res) => {
+  try {
+    const paymentsCol = req.db.collection("payments");
+    const { search, status } = req.query;
+    const { skip, limit } = parsePagination(req.query);
+
+    const filter = {};
+    if (status) filter.paymentStatus = status;
+    if (search) {
+      filter.$or = [
+        { buyerEmail: { $regex: search, $options: "i" } },
+        { transactionId: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const result = await paymentsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
+    const total = await paymentsCol.countDocuments(filter);
+
+    res.status(200).json({ success: true, result, total });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to fetch payments" });
+  }
+});
+
 // --- ANALYTICS ---
 app.get("/admin/analytics", async (req, res) => {
   try {
@@ -539,9 +667,7 @@ app.get("/admin/analytics", async (req, res) => {
     });
   } catch (e) {
     console.error("Analytics error:", e);
-    res
-      .status(500)
-      .json({ success: false, message: e.message, details: e.stack, cause: e.cause, name: e.name, code: e.code, info: e.info });
+    res.status(500).json({ success: false, message: "Failed to load analytics" });
   }
 });
 
@@ -642,7 +768,6 @@ app.get("/admin/analytics/summary", async (req, res) => {
       ])
       .toArray();
 
-    console.log("Total revenue data:", totalRevenueData); // Debugging line
     const totalRevenue =
       totalRevenueData.length > 0 ? totalRevenueData[0].totalRevenue : 0;
 
@@ -792,7 +917,7 @@ app.get("/seller/stats", async (req, res) => {
     const paymentsCol = req.db.collection("payments");
 
     const totalProducts = await productsCol.countDocuments({ sellerEmail: req.user.email });
-    const totalOrders = await ordersCol.countDocuments({ sellerEmail: req.user.email });
+    const totalSales = await ordersCol.countDocuments({ sellerEmail: req.user.email, orderStatus: "delivered" });
     const pendingOrders = await ordersCol.countDocuments({ sellerEmail: req.user.email, orderStatus: "pending" });
 
     const revenueData = await paymentsCol.aggregate([
@@ -803,7 +928,7 @@ app.get("/seller/stats", async (req, res) => {
 
     res.status(200).json({
       success: true,
-      result: { totalProducts, totalOrders, totalRevenue, pendingOrders },
+      result: { totalProducts, totalSales, totalRevenue, pendingOrders },
     });
   } catch (e) {
     res.status(500).json({ success: false, message: "Failed to fetch seller stats" });
@@ -1063,6 +1188,11 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
     const ordersCol = req.db.collection("orders");
     const paymentsCol = req.db.collection("payments");
 
+    const existing = await paymentsCol.findOne({ transactionId });
+    if (existing) {
+      return res.status(409).json({ success: false, message: "Payment already recorded" });
+    }
+
     const product = await productsCol.findOne({ _id: new ObjectId(productId) });
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
@@ -1138,6 +1268,44 @@ app.get("/payments/my-history", verifyToken, buyerGuard, async (req, res) => {
     res.status(200).json({ success: true, result, total });
   } catch (e) {
     res.status(500).json({ success: false, message: "Failed to fetch payment history" });
+  }
+});
+
+// ==========================================
+// REVIEWS — PROTECTED WRITE  (buyer | admin)
+// ==========================================
+
+app.post("/reviews", verifyToken, buyerGuard, async (req, res) => {
+  try {
+    const { productId, rating, comment } = req.body;
+    if (!productId || rating == null) {
+      return res.status(400).json({ success: false, message: "productId and rating are required" });
+    }
+
+    const buyer = req.dbUser;
+    const reviewsCol = req.db.collection("reviews");
+
+    // One review per buyer per product
+    const existing = await reviewsCol.findOne({ productId, "reviewerInfo.userId": buyer._id.toString() });
+    if (existing) {
+      return res.status(409).json({ success: false, message: "You have already reviewed this product" });
+    }
+
+    const review = {
+      reviewerInfo: {
+        userId: buyer._id.toString(),
+        name: buyer.name,
+      },
+      productId,
+      rating: Number(rating),
+      comment: comment || "",
+      createdAt: new Date(),
+    };
+
+    const result = await reviewsCol.insertOne(review);
+    res.status(201).json({ success: true, message: "Review submitted", result });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to submit review" });
   }
 });
 
@@ -1279,6 +1447,4 @@ If the user refreshes their browser after the 500ms mark, the second request wil
 
 But in a serverless environment, Vercel often spins down the container after that first 404 because it thinks the job is done. So the container dies before run() ever finishes.
 
-
-
-  */
+*/
