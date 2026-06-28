@@ -180,11 +180,11 @@ app.get("/", (req, res) => {
 app.get("/products", async (req, res) => {
   try {
     const productsCol = req.db.collection("products");
-    const { sort, order, limit, search, category, status, condition } =
-      req.query;
+    const { sort, order, search, category, status, condition } = req.query;
+    const { page, limit, skip } = parsePagination(req.query); // use parsePagination
 
     const filter = {};
-    if (search) filter.title = { $regex: search, $options: "i" }; // Fixed: was filter.name
+    if (search) filter.title = { $regex: search, $options: "i" };
     if (category) filter.category = category;
     if (status) filter.status = status;
     if (condition) filter.condition = condition;
@@ -196,26 +196,27 @@ app.get("/products", async (req, res) => {
       if (sort === "dateUploaded") sortObj.dateUploaded = direction;
     }
 
-    const limitNum = limit ? parseInt(limit, 10) : 10;
-
     const result = await productsCol
       .find(filter)
-      .limit(limitNum)
       .sort(sortObj)
+      .skip(skip)          // ← was missing
+      .limit(limit)
       .toArray();
+
+    const total = await productsCol.countDocuments(filter); // ← was missing
 
     res.status(200).json({
       success: true,
-      message: "Products are loaded successfully",
+      message: "Products loaded successfully",
       result,
+      total,               // ← needed for pagination controls
+      page,
+      limit,
     });
   } catch (e) {
-    console.error("Load products error:", e);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to load products" });
+    res.status(500).json({ success: false, message: "Failed to load products" });
   }
-});
+});;
 
 app.get("/products/:id", async (req, res) => {
   try {
@@ -1000,6 +1001,116 @@ app.patch("/profile", verifyToken, async (req, res) => {
 // ==========================================
 // PAYMENTS ROUTES  (buyer | admin)
 // ==========================================
+
+app.post("/payments/create-intent", verifyToken, buyerGuard, async (req, res) => {
+  try {
+    const { amount, productId, productTitle } = req.body;
+
+    if (!amount || !productId) {
+      return res.status(400).json({ success: false, message: "amount and productId are required" });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100), // Stripe expects amount in paisa/cents
+      currency: "bdt",                  // change to "usd" if needed
+      metadata: {
+        productId,
+        productTitle,
+        buyerEmail: req.user.email,
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      result: { clientSecret: paymentIntent.client_secret },
+    });
+  } catch (e) {
+    console.error("Stripe create-intent error:", e);
+    res.status(500).json({ success: false, message: "Failed to create payment intent" });
+  }
+});
+
+// POST /payments/confirm
+// Protected: buyer must be logged in
+// Body: { transactionId, productId, sellerEmail, amount, productTitle }
+app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
+  try {
+    const { transactionId, productId, sellerEmail, amount, productTitle } = req.body;
+
+    if (!transactionId || !productId) {
+      return res.status(400).json({ success: false, message: "transactionId and productId are required" });
+    }
+
+    // Verify the payment intent actually succeeded with Stripe
+    const paymentIntent = await stripe.paymentIntents.retrieve(transactionId);
+    if (paymentIntent.status !== "succeeded") {
+      return res.status(400).json({ success: false, message: "Payment not confirmed by Stripe" });
+    }
+
+    const buyer = req.dbUser;
+    const productsCol = req.db.collection("products");
+    const ordersCol = req.db.collection("orders");
+    const paymentsCol = req.db.collection("payments");
+
+    const product = await productsCol.findOne({ _id: new ObjectId(productId) });
+    if (!product) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    const now = new Date();
+
+    // 1. Create the order
+    const order = {
+      buyerInfo: {
+        userId: buyer._id.toString(),
+        name: buyer.name,
+        email: buyer.email,
+      },
+      sellerInfo: {
+        email: product.sellerEmail,
+        name: product.sellerName,
+      },
+      sellerEmail: product.sellerEmail,
+      productId,
+      productTitle: product.title,
+      totalAmount: amount,
+      orderStatus: "pending",
+      paymentStatus: "paid",
+      createdAt: now,
+      updatedAt: now,
+    };
+    const orderResult = await ordersCol.insertOne(order);
+
+    // 2. Save payment record
+    const payment = {
+      transactionId,
+      orderId: orderResult.insertedId.toString(),
+      productId,
+      buyerEmail: buyer.email,
+      sellerEmail: product.sellerEmail,
+      amount,
+      paymentStatus: "success",
+      paymentMethod: "stripe",
+      createdAt: now,
+    };
+    await paymentsCol.insertOne(payment);
+
+    // 3. Mark product as sold (optional — remove if you allow multiple sales)
+    await productsCol.updateOne(
+      { _id: new ObjectId(productId) },
+      { $set: { status: "sold", updatedAt: now } }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Order and payment saved",
+      result: { orderId: orderResult.insertedId },
+    });
+  } catch (e) {
+    console.error("Stripe confirm error:", e);
+    res.status(500).json({ success: false, message: "Failed to save payment" });
+  }
+});
 
 app.get("/payments/my-history", verifyToken, buyerGuard, async (req, res) => {
   try {
