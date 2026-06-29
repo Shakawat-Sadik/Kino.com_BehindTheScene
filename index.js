@@ -50,20 +50,28 @@ app.use(express.json());
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 let cacheDB = null;
+let connectPromise = null;
 
 const connectToDB = async () => {
   if (cacheDB) return cacheDB;
 
-  try {
-    // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
-
-    cacheDB = await client.db("kino_main");
-    return cacheDB;
-  } catch (e) {
-    console.log("Error connecting to MongoDB", e);
+  // ✅ Fix: Reuse same promise if connection is in progress
+  if (!connectPromise) {
+    connectPromise = (async () => {
+      try {
+        await client.connect();
+        cacheDB = await client.db("kino_main");
+        return cacheDB;
+      } catch (e) {
+        connectPromise = null; // Allow retry on failure
+        throw e;
+      }
+    })();
   }
+
+  return connectPromise;
 };
+
 
 // Make DB available in all routes easily
 app.use(async (req, res, next) => {
