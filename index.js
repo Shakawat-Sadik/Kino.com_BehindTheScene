@@ -75,9 +75,12 @@ const connectToDB = async () => {
 
 // Make DB available in all routes easily
 app.use(async (req, res, next) => {
-  req.db = await connectToDB();
-  next();
-});
+  try {
+    req.db = await connectToDB();
+    next();
+  } catch (e) {
+    res.status(503).json({ success: false, message: "Database unavailable" });
+  }
 
 // ==========================================
 // MIDDLEWARE
