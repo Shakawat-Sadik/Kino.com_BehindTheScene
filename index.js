@@ -40,14 +40,18 @@ app.use(
   cors({
     origin: [
       "http://localhost:3000",
-      process.env.CLIENT_URL, // your Vercel URL when deployed
+      process.env.CLIENT_URL,
     ].filter(Boolean),
-    credentials: true, // needed if you send cookies/JWT later
+    credentials: true,
   }),
 );
 app.use(express.json());
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// ==========================================
+// DB CONNECTION (with race condition fix)
+// ==========================================
 
 let cacheDB = null;
 let connectPromise = null;
@@ -72,8 +76,7 @@ const connectToDB = async () => {
   return connectPromise;
 };
 
-
-// Make DB available in all routes easily
+// Make DB available in all routes
 app.use(async (req, res, next) => {
   try {
     req.db = await connectToDB();
@@ -82,95 +85,17 @@ app.use(async (req, res, next) => {
     res.status(503).json({ success: false, message: "Database unavailable" });
   }
 });
+
 // ==========================================
-// MIDDLEWARE
+// HELPERS
 // ==========================================
 
-const verifyToken = async (req, res, next) => {
+// ✅ Fix: Validate ObjectId before using it
+const isValidObjectId = (id) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-      return res
-        .status(401)
-        .json({ success: false, message: "Unauthorized entry" });
-    }
-    const token = authHeader.split(" ")[1];
-    try {
-      const { payload } = await jwtVerify(token, JWKS);
-      req.user = payload;
-      console.log("JWT authenticated:", req.user);
-      next();
-    } catch (e) {
-      return res
-        .status(403)
-        .json({ success: false, message: "Invalid or expired token" });
-    }
-  } catch (e) {
-    return res
-      .status(401)
-      .json({ success: false, message: "Authentication error" });
-  }
-};
-
-const adminGuard = async (req, res, next) => {
-  try {
-    if (!req.user || !req.user.email) {
-      return res
-        .status(401)
-        .json({ success: false, message: "Not authenticated" });
-    }
-    const usersCol = req.db.collection("user");
-    const user = await usersCol.findOne({
-      email: req.user.email,
-      role: "admin",
-    });
-    if (!user || user.role.toLowerCase() !== "admin") {
-      return res
-        .status(403)
-        .json({ success: false, message: "Forbidden: Admins only" });
-    }
-    req.dbUser = user;
-    next();
-  } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Authorization check failed" });
-  }
-};
-
-// Sellers AND admins are allowed
-const sellerGuard = async (req, res, next) => {
-  try {
-    if (!req.user || !req.user.email) {
-      return res.status(401).json({ success: false, message: "Not authenticated" });
-    }
-    const usersCol = req.db.collection("user");
-    const user = await usersCol.findOne({ email: req.user.email });
-    if (!user || !["seller", "admin"].includes(user.role?.toLowerCase())) {
-      return res.status(403).json({ success: false, message: "Forbidden: Sellers and Admins only" });
-    }
-    req.dbUser = user;
-    next();
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Authorization check failed" });
-  }
-};
-
-// Buyers AND admins are allowed
-const buyerGuard = async (req, res, next) => {
-  try {
-    if (!req.user || !req.user.email) {
-      return res.status(401).json({ success: false, message: "Not authenticated" });
-    }
-    const usersCol = req.db.collection("user");
-    const user = await usersCol.findOne({ email: req.user.email });
-    if (!user || !["buyer", "admin"].includes(user.role?.toLowerCase())) {
-      return res.status(403).json({ success: false, message: "Forbidden: Buyers and Admins only" });
-    }
-    req.dbUser = user;
-    next();
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Authorization check failed" });
+    return ObjectId.isValid(id) && new ObjectId(id).toString() === id;
+  } catch {
+    return false;
   }
 };
 
@@ -178,6 +103,89 @@ const parsePagination = (query) => {
   const page = Math.max(1, parseInt(query.page, 10) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(query.limit, 10) || 10));
   return { page, limit, skip: (page - 1) * limit };
+};
+
+// Safe error response (no leaks in production)
+const sendError = (res, statusCode, message, error = null) => {
+  if (error) console.error(`[${message}]`, error);
+  res.status(statusCode).json({
+    success: false,
+    message: process.env.NODE_ENV === "development" && error ? error.message : message,
+  });
+};
+
+// ==========================================
+// MIDDLEWARE
+// ==========================================
+
+const verifyToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ success: false, message: "Unauthorized entry" });
+    }
+    const token = authHeader.split(" ")[1];
+    try {
+      const { payload } = await jwtVerify(token, JWKS);
+      req.user = payload;
+      next();
+    } catch (e) {
+      return res.status(403).json({ success: false, message: "Invalid or expired token" });
+    }
+  } catch (e) {
+    return res.status(401).json({ success: false, message: "Authentication error" });
+  }
+};
+
+const adminGuard = async (req, res, next) => {
+  try {
+    if (!req.user?.email) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+    const user = await req.db.collection("user").findOne({
+      email: req.user.email,
+      role: "admin",
+    });
+    if (!user) {
+      return res.status(403).json({ success: false, message: "Forbidden: Admins only" });
+    }
+    req.dbUser = user;
+    next();
+  } catch (error) {
+    sendError(res, 500, "Authorization check failed", error);
+  }
+};
+
+const sellerGuard = async (req, res, next) => {
+  try {
+    if (!req.user?.email) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+    const user = await req.db.collection("user").findOne({ email: req.user.email });
+    if (!user || !["seller", "admin"].includes(user.role?.toLowerCase())) {
+      return res.status(403).json({ success: false, message: "Forbidden: Sellers and Admins only" });
+    }
+    req.dbUser = user;
+    next();
+  } catch (error) {
+    sendError(res, 500, "Authorization check failed", error);
+  }
+};
+
+const buyerGuard = async (req, res, next) => {
+  try {
+    if (!req.user?.email) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+    const user = await req.db.collection("user").findOne({ email: req.user.email });
+    if (!user || !["buyer", "admin"].includes(user.role?.toLowerCase())) {
+      return res.status(403).json({ success: false, message: "Forbidden: Buyers and Admins only" });
+    }
+    req.dbUser = user;
+    next();
+  } catch (error) {
+    sendError(res, 500, "Authorization check failed", error);
+  }
 };
 
 // ==========================================
@@ -188,11 +196,126 @@ app.get("/", (req, res) => {
   res.json({ message: "Kino.com server has started" });
 });
 
+// ✅ NEW: Public marketplace stats (for home page)
+app.get("/stats", async (req, res) => {
+  try {
+    const [totalProducts, totalOrders, sellers, buyers] = await Promise.all([
+      req.db.collection("products").countDocuments(),
+      req.db.collection("orders").countDocuments(),
+      req.db.collection("user").countDocuments({ role: "seller" }),
+      req.db.collection("user").countDocuments({ role: "buyer" }),
+    ]);
+    res.status(200).json({
+      success: true,
+      result: { totalProducts, totalOrders, totalSellers: sellers, totalBuyers: buyers },
+    });
+  } catch (e) {
+    sendError(res, 500, "Failed to fetch stats", e);
+  }
+});
+
+// ✅ NEW: Public top sellers
+app.get("/sellers/top", async (req, res) => {
+  try {
+    const limit = Math.min(10, parseInt(req.query.limit, 10) || 3);
+    const sellers = await req.db.collection("user")
+      .aggregate([
+        { $match: { role: "seller" } },
+        {
+          $lookup: {
+            from: "products",
+            localField: "email",
+            foreignField: "sellerEmail",
+            as: "products",
+          },
+        },
+        {
+          $project: {
+            name: 1,
+            email: 1,
+            image: 1,
+            location: 1,
+            productCount: { $size: "$products" },
+          },
+        },
+        { $sort: { productCount: -1 } },
+        { $limit: limit },
+      ])
+      .toArray();
+    res.status(200).json({ success: true, result: sellers });
+  } catch (e) {
+    sendError(res, 500, "Failed to fetch top sellers", e);
+  }
+});
+
+// ✅ NEW: Public reviews
+app.get("/reviews", async (req, res) => {
+  try {
+    const limit = Math.min(50, parseInt(req.query.limit, 10) || 6);
+    const reviews = await req.db.collection("reviews")
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .toArray();
+    res.status(200).json({ success: true, result: reviews });
+  } catch (e) {
+    sendError(res, 500, "Failed to fetch reviews", e);
+  }
+});
+
+app.get("/reviews/:productId", async (req, res) => {
+  try {
+    if (!isValidObjectId(req.params.productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+    const reviews = await req.db.collection("reviews")
+      .find({ productId: req.params.productId })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.status(200).json({ success: true, result: reviews });
+  } catch (e) {
+    sendError(res, 500, "Failed to fetch reviews", e);
+  }
+});
+
+app.post("/reviews", verifyToken, buyerGuard, async (req, res) => {
+  try {
+    const { productId, rating, comment } = req.body;
+    if (!productId || !rating) {
+      return res.status(400).json({ success: false, message: "productId and rating are required" });
+    }
+    if (!isValidObjectId(productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+
+    const reviewsCol = req.db.collection("reviews");
+    const existing = await reviewsCol.findOne({ productId, buyerEmail: req.user.email });
+    if (existing) {
+      return res.status(409).json({ success: false, message: "You have already reviewed this product" });
+    }
+
+    const review = {
+      productId,
+      buyerEmail: req.user.email,
+      buyerName: req.dbUser?.name || "",
+      rating: Math.min(5, Math.max(1, Number(rating))),
+      comment: comment || "",
+      createdAt: new Date(),
+    };
+
+    const result = await reviewsCol.insertOne(review);
+    res.status(201).json({ success: true, message: "Review added", result });
+  } catch (e) {
+    sendError(res, 500, "Failed to add review", e);
+  }
+});
+
+// --- PRODUCTS ---
 app.get("/products", async (req, res) => {
   try {
     const productsCol = req.db.collection("products");
     const { sort, order, search, category, status, condition } = req.query;
-    const { page, limit, skip } = parsePagination(req.query); // use parsePagination
+    const { page, limit, skip } = parsePagination(req.query);
 
     const filter = {};
     if (search) filter.title = { $regex: search, $options: "i" };
@@ -207,145 +330,37 @@ app.get("/products", async (req, res) => {
       if (sort === "dateUploaded") sortObj.dateUploaded = direction;
     }
 
-    const result = await productsCol
-      .find(filter)
-      .sort(sortObj)
-      .skip(skip)          // ← was missing
-      .limit(limit)
-      .toArray();
-
-    const total = await productsCol.countDocuments(filter); // ← was missing
+    const [result, total] = await Promise.all([
+      productsCol.find(filter).sort(sortObj).skip(skip).limit(limit).toArray(),
+      productsCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({
       success: true,
       message: "Products loaded successfully",
       result,
-      total,               // ← needed for pagination controls
+      total,
       page,
       limit,
     });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to load products" });
+    sendError(res, 500, "Failed to load products", e);
   }
-});;
+});
 
 app.get("/products/:id", async (req, res) => {
   try {
-    const productsCol = req.db.collection("products");
-    const { id } = req.params;
-    // Fixed: Searching by _id ObjectId instead of string id
-    const result = await productsCol.findOne({ _id: new ObjectId(id) });
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+    const result = await req.db.collection("products").findOne({ _id: new ObjectId(req.params.id) });
 
-    if (!result)
-      return res
-        .status(404)
-        .json({ success: false, message: "Product not found" });
-    res
-      .status(200)
-      .json({ success: true, message: "Product info loaded", result });
+    if (!result) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    res.status(200).json({ success: true, message: "Product info loaded", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to load product" });
-  }
-});
-
-app.get("/stats", async (req, res) => {
-  try {
-    const productsCol = req.db.collection("products");
-    const usersCol = req.db.collection("user");
-    const ordersCol = req.db.collection("orders");
-
-    const [totalProducts, totalSellers, totalBuyers, totalOrders] = await Promise.all([
-      productsCol.countDocuments({ status: "available" }),
-      usersCol.countDocuments({ role: "seller" }),
-      usersCol.countDocuments({ role: "buyer" }),
-      ordersCol.countDocuments({ orderStatus: "delivered" }),
-    ]);
-
-    res.status(200).json({
-      success: true,
-      result: { totalProducts, totalSellers, totalBuyers, totalOrders },
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch stats" });
-  }
-});
-
-// ==========================================
-// SELLERS — PUBLIC TOP SELLERS
-// ==========================================
-
-app.get("/sellers/top", async (req, res) => {
-  try {
-    const productsCol = req.db.collection("products");
-    const usersCol = req.db.collection("user");
-    const limit = Math.min(parseInt(req.query.limit) || 3, 10);
-
-    const topSellers = await productsCol
-      .aggregate([
-        { $match: { status: "available" } },
-        {
-          $group: {
-            _id: "$sellerInfo.userId",
-            productCount: { $sum: 1 },
-            sellerInfo: { $first: "$sellerInfo" },
-          },
-        },
-        { $sort: { productCount: -1 } },
-        { $limit: limit },
-      ])
-      .toArray();
-
-    const enriched = await Promise.all(
-      topSellers.map(async (s) => {
-        let user = null;
-        try {
-          user = await usersCol.findOne({ _id: new ObjectId(s._id) });
-        } catch {}
-        return {
-          _id: s._id,
-          name: user?.name || s.sellerInfo?.name || "Seller",
-          location: user?.location || {},
-          productCount: s.productCount,
-          image: user?.image || null,
-        };
-      })
-    );
-
-    res.status(200).json({ success: true, result: enriched });
-  } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch top sellers" });
-  }
-});
-
-// ==========================================
-// REVIEWS — PUBLIC READ
-// ==========================================
-
-app.get("/reviews", async (req, res) => {
-  try {
-    const reviewsCol = req.db.collection("reviews");
-    const limit = Math.min(parseInt(req.query.limit) || 6, 20);
-    const result = await reviewsCol
-      .find({ rating: { $gte: 4 } })
-      .sort({ _id: -1 })
-      .limit(limit)
-      .toArray();
-    res.status(200).json({ success: true, result });
-  } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch reviews" });
-  }
-});
-
-app.get("/reviews/:productId", async (req, res) => {
-  try {
-    const reviewsCol = req.db.collection("reviews");
-    const result = await reviewsCol
-      .find({ productId: req.params.productId })
-      .sort({ _id: -1 })
-      .toArray();
-    res.status(200).json({ success: true, result });
-  } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch reviews" });
+    sendError(res, 500, "Failed to load product", e);
   }
 });
 
@@ -353,7 +368,6 @@ app.get("/reviews/:productId", async (req, res) => {
 // ADMIN PROTECTED ROUTES
 // ==========================================
 
-// All /admin routes require valid token AND admin role
 app.use("/admin", verifyToken, adminGuard);
 
 // --- USERS ---
@@ -377,46 +391,42 @@ app.get("/admin/users", async (req, res) => {
     if (sort) sortObj[sort] = order === "desc" ? -1 : 1;
     else sortObj.createdAt = -1;
 
-    const result = await usersCol
-      .find(filter)
-      .sort(sortObj)
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-    const total = await usersCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      usersCol.find(filter).sort(sortObj).skip(skip).limit(limit).toArray(),
+      usersCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch users" });
+    sendError(res, 500, "Failed to fetch users", e);
   }
 });
 
 app.patch("/admin/users/:userId/status", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.userId)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID" });
+    }
     const { status } = req.body;
-    if (!status)
-      return res
-        .status(400)
-        .json({ success: false, message: "Status is required" });
+    if (!status) {
+      return res.status(400).json({ success: false, message: "Status is required" });
+    }
 
-    const result = await req.db
-      .collection("user")
-      .updateOne(
-        { _id: new ObjectId(req.params.userId) },
-        { $set: { status } },
-      );
-    res
-      .status(200)
-      .json({ success: true, message: "User status updated", result });
+    const result = await req.db.collection("user").updateOne(
+      { _id: new ObjectId(req.params.userId) },
+      { $set: { status } },
+    );
+    res.status(200).json({ success: true, message: "User status updated", result });
   } catch (e) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to update user status" });
+    sendError(res, 500, "Failed to update user status", e);
   }
 });
 
 app.patch("/admin/users/:userId", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.userId)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID" });
+    }
     const { name, role, location, contact } = req.body;
     const update = { updatedAt: new Date() };
     if (name !== undefined) update.name = name;
@@ -424,25 +434,25 @@ app.patch("/admin/users/:userId", async (req, res) => {
     if (location !== undefined) update.location = location;
     if (contact !== undefined) update.contact = contact;
 
-    const result = await req.db
-      .collection("user")
-      .updateOne({ _id: new ObjectId(req.params.userId) }, { $set: update });
+    const result = await req.db.collection("user").updateOne(
+      { _id: new ObjectId(req.params.userId) },
+      { $set: update },
+    );
     res.status(200).json({ success: true, message: "User updated", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update user" });
+    sendError(res, 500, "Failed to update user", e);
   }
 });
 
 app.delete("/admin/users/:userId", async (req, res) => {
   try {
-    await req.db
-      .collection("user")
-      .deleteOne({ _id: new ObjectId(req.params.userId) });
-    res
-      .status(200)
-      .json({ success: true, message: "User deleted", result: null });
+    if (!isValidObjectId(req.params.userId)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID" });
+    }
+    await req.db.collection("user").deleteOne({ _id: new ObjectId(req.params.userId) });
+    res.status(200).json({ success: true, message: "User deleted", result: null });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to delete user" });
+    sendError(res, 500, "Failed to delete user", e);
   }
 });
 
@@ -458,24 +468,22 @@ app.get("/admin/products", async (req, res) => {
     if (category) filter.category = category;
     if (status) filter.status = status;
 
-    const result = await productsCol
-      .find(filter)
-      .sort({ _id: -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-    const total = await productsCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      productsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      productsCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch products" });
+    sendError(res, 500, "Failed to fetch products", e);
   }
 });
 
 app.patch("/admin/products/:productId", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
     const { title, category, condition, price, description } = req.body;
     const update = { updatedAt: new Date() };
     if (title !== undefined) update.title = title;
@@ -484,48 +492,41 @@ app.patch("/admin/products/:productId", async (req, res) => {
     if (price !== undefined) update.price = Number(price);
     if (description !== undefined) update.description = description;
 
-    const result = await req.db
-      .collection("products")
-      .updateOne({ _id: new ObjectId(req.params.productId) }, { $set: update });
+    const result = await req.db.collection("products").updateOne(
+      { _id: new ObjectId(req.params.productId) },
+      { $set: update },
+    );
     res.status(200).json({ success: true, message: "Product updated", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update product" });
+    sendError(res, 500, "Failed to update product", e);
   }
 });
 
 app.patch("/admin/products/:productId/status", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
     const { status } = req.body;
-    if (!status)
-      return res.status(400).json({ success: false, message: "Status is required" });
-    const result = await req.db
-      .collection("products")
-      .updateOne(
-        { _id: new ObjectId(req.params.productId) },
-        { $set: { status } },
-      );
-    res
-      .status(200)
-      .json({ success: true, message: "Product status updated", result });
+    const result = await req.db.collection("products").updateOne(
+      { _id: new ObjectId(req.params.productId) },
+      { $set: { status } },
+    );
+    res.status(200).json({ success: true, message: "Product status updated", result });
   } catch (e) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to update product status" });
+    sendError(res, 500, "Failed to update product status", e);
   }
 });
 
 app.delete("/admin/products/:productId", async (req, res) => {
   try {
-    await req.db
-      .collection("products")
-      .deleteOne({ _id: new ObjectId(req.params.productId) });
-    res
-      .status(200)
-      .json({ success: true, message: "Product deleted", result: null });
+    if (!isValidObjectId(req.params.productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+    await req.db.collection("products").deleteOne({ _id: new ObjectId(req.params.productId) });
+    res.status(200).json({ success: true, message: "Product deleted", result: null });
   } catch (e) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to delete product" });
+    sendError(res, 500, "Failed to delete product", e);
   }
 });
 
@@ -545,40 +546,34 @@ app.get("/admin/orders", async (req, res) => {
       ];
     }
 
-    const result = await ordersCol
-      .find(filter)
-      .sort({ _id: -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-    const total = await ordersCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      ordersCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      ordersCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch orders" });
+    sendError(res, 500, "Failed to fetch orders", e);
   }
 });
 
 app.patch("/admin/orders/:orderId/status", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.orderId)) {
+      return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
     const { status } = req.body;
-    const result = await req.db
-      .collection("orders")
-      .updateOne(
-        { _id: new ObjectId(req.params.orderId) },
-        { $set: { orderStatus: status } },
-      );
-    res
-      .status(200)
-      .json({ success: true, message: "Order status updated", result });
+    const result = await req.db.collection("orders").updateOne(
+      { _id: new ObjectId(req.params.orderId) },
+      { $set: { orderStatus: status } },
+    );
+    res.status(200).json({ success: true, message: "Order status updated", result });
   } catch (e) {
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to update order status" });
+    sendError(res, 500, "Failed to update order status", e);
   }
 });
 
-// --- PAYMENTS (Admin monitoring) ---
+// ✅ NEW: Admin payments route
 app.get("/admin/payments", async (req, res) => {
   try {
     const paymentsCol = req.db.collection("payments");
@@ -590,16 +585,19 @@ app.get("/admin/payments", async (req, res) => {
     if (search) {
       filter.$or = [
         { buyerEmail: { $regex: search, $options: "i" } },
+        { sellerEmail: { $regex: search, $options: "i" } },
         { transactionId: { $regex: search, $options: "i" } },
       ];
     }
 
-    const result = await paymentsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
-    const total = await paymentsCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      paymentsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      paymentsCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch payments" });
+    sendError(res, 500, "Failed to fetch payments", e);
   }
 });
 
@@ -611,63 +609,37 @@ app.get("/admin/analytics", async (req, res) => {
     const usersCol = req.db.collection("user");
     const paymentsCol = req.db.collection("payments");
 
-    const monthlyOrders = await ordersCol
-      .aggregate([
-        {
-          $group: {
-            _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
-            count: { $sum: 1 },
-          },
-        },
+    const [monthlyOrders, categoryPerformance, userGrowth, revenueByMonth] = await Promise.all([
+      ordersCol.aggregate([
+        { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, count: { $sum: 1 } } },
         { $sort: { _id: 1 } },
-      ])
-      .toArray();
-
-    const categoryPerformance = await productsCol
-      .aggregate([
+      ]).toArray(),
+      productsCol.aggregate([
         { $group: { _id: "$category", count: { $sum: 1 } } },
         { $sort: { count: -1 } },
-      ])
-      .toArray();
-
-    const userGrowth = await usersCol
-      .aggregate([{ $group: { _id: "$role", count: { $sum: 1 } } }])
-      .toArray();
-
-    const revenueByMonth = await paymentsCol
-      .aggregate([
+      ]).toArray(),
+      usersCol.aggregate([
+        { $group: { _id: "$role", count: { $sum: 1 } } },
+      ]).toArray(),
+      paymentsCol.aggregate([
         { $match: { paymentStatus: "success" } },
-        {
-          $group: {
-            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-            revenue: { $sum: "$amount" },
-          },
-        },
+        { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, revenue: { $sum: "$amount" } } },
         { $sort: { _id: 1 } },
-      ])
-      .toArray();
+      ]).toArray(),
+    ]);
 
     res.status(200).json({
       success: true,
       result: {
-        monthlyOrders: monthlyOrders.map((m) => ({
-          month: m._id,
-          count: m.count,
-        })),
-        categoryPerformance: categoryPerformance.map((c) => ({
-          category: c._id,
-          count: c.count,
-        })),
+        monthlyOrders: monthlyOrders.map((m) => ({ month: m._id, count: m.count })),
+        categoryPerformance: categoryPerformance.map((c) => ({ category: c._id, count: c.count })),
         userGrowth: userGrowth.map((u) => ({ role: u._id, count: u.count })),
-        revenueByMonth: revenueByMonth.map((r) => ({
-          month: r._id,
-          revenue: r.revenue,
-        })),
+        revenueByMonth: revenueByMonth.map((r) => ({ month: r._id, revenue: r.revenue })),
       },
     });
   } catch (e) {
-    console.error("Analytics error:", e);
-    res.status(500).json({ success: false, message: "Failed to load analytics" });
+    // ✅ Fix: Don't leak error details in production
+    sendError(res, 500, "Failed to load analytics", e);
   }
 });
 
@@ -677,7 +649,7 @@ app.get("/admin/stats/users", async (req, res) => {
     const total = await req.db.collection("user").countDocuments();
     res.status(200).json({ success: true, result: { total } });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch stats" });
+    sendError(res, 500, "Failed to fetch stats", e);
   }
 });
 
@@ -686,7 +658,7 @@ app.get("/admin/stats/products", async (req, res) => {
     const total = await req.db.collection("products").countDocuments();
     res.status(200).json({ success: true, result: { total } });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch stats" });
+    sendError(res, 500, "Failed to fetch stats", e);
   }
 });
 
@@ -695,106 +667,63 @@ app.get("/admin/stats/orders", async (req, res) => {
     const total = await req.db.collection("orders").countDocuments();
     res.status(200).json({ success: true, result: { total } });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch stats" });
+    sendError(res, 500, "Failed to fetch stats", e);
   }
 });
 
 app.get("/admin/stats/revenue", async (req, res) => {
   try {
-    const totalRevenueData = await req.db
-      .collection("payments")
-      .aggregate([
-        { $match: { paymentStatus: "success" } },
-        { $group: { _id: null, totalRevenue: { $sum: "$amount" } } },
-      ])
-      .toArray();
-
-    const totalRevenue =
-      totalRevenueData.length > 0 ? totalRevenueData[0].totalRevenue : 0;
+    const data = await req.db.collection("payments").aggregate([
+      { $match: { paymentStatus: "success" } },
+      { $group: { _id: null, totalRevenue: { $sum: "$amount" } } },
+    ]).toArray();
+    const totalRevenue = data.length > 0 ? data[0].totalRevenue : 0;
     res.status(200).json({ success: true, result: { totalRevenue } });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch stats" });
+    sendError(res, 500, "Failed to fetch stats", e);
   }
 });
 
 app.get("/admin/stats/revenue-by-month", async (req, res) => {
   try {
-    const revenueByMonth = await req.db.collection("payments");
-    const revenueData = await revenueByMonth
-      .aggregate([
-        { $match: { paymentStatus: "success" } },
-        {
-          $group: {
-            _id: { $month: "$createdAt" },
-            revenue: { $sum: "$amount" },
-          },
-        },
-      ])
-      .toArray();
-
-    res
-      .status(200)
-      .json({ success: true, result: { revenueByMonth: revenueData } });
+    const revenueData = await req.db.collection("payments").aggregate([
+      { $match: { paymentStatus: "success" } },
+      { $group: { _id: { $month: "$createdAt" }, revenue: { $sum: "$amount" } } },
+    ]).toArray();
+    res.status(200).json({ success: true, result: { revenueByMonth: revenueData } });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch stats" });
+    sendError(res, 500, "Failed to fetch stats", e);
   }
 });
 
 app.get("/admin/analytics/summary", async (req, res) => {
   try {
-    const ordersCol = req.db.collection("orders");
-    const productsCol = req.db.collection("products");
-    const usersCol = req.db.collection("user");
-    const paymentsCol = req.db.collection("payments");
+    const [totalOrders, totalProducts, totalUsers, revenueData] = await Promise.all([
+      req.db.collection("orders").countDocuments(),
+      req.db.collection("products").countDocuments(),
+      req.db.collection("user").countDocuments(),
+      req.db.collection("payments").aggregate([
+        { $match: { paymentStatus: "success" } },
+        { $group: { _id: null, totalRevenue: { $sum: "$amount" } } },
+      ]).toArray(),
+    ]);
 
-    const totalOrders = await ordersCol.countDocuments();
-    const totalProducts = await productsCol.countDocuments();
-    const totalUsers = await usersCol.countDocuments();
-    const totalRevenueData = await paymentsCol
-      .aggregate([
-        {
-          $match: {
-            paymentStatus: "success",
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            totalRevenue: {
-              $sum: "$amount",
-            },
-          },
-        },
-      ])
-      .toArray();
-
-    const totalRevenue =
-      totalRevenueData.length > 0 ? totalRevenueData[0].totalRevenue : 0;
+    const totalRevenue = revenueData.length > 0 ? revenueData[0].totalRevenue : 0;
 
     res.status(200).json({
       success: true,
-      result: {
-        totalOrders,
-        totalProducts,
-        totalUsers,
-        totalRevenue,
-      },
+      result: { totalOrders, totalProducts, totalUsers, totalRevenue },
     });
   } catch (e) {
-    console.error("Analytics summary error:", e);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to load analytics summary" });
+    sendError(res, 500, "Failed to load analytics summary", e);
   }
 });
 
 // ==========================================
-// SELLER PROTECTED ROUTES  (seller | admin)
+// SELLER PROTECTED ROUTES
 // ==========================================
 
 app.use("/seller", verifyToken, sellerGuard);
-
-// --- SELLER PRODUCTS ---
 
 app.get("/seller/products", async (req, res) => {
   try {
@@ -807,64 +736,68 @@ app.get("/seller/products", async (req, res) => {
     if (category) filter.category = category;
     if (status) filter.status = status;
 
-    const result = await productsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
-    const total = await productsCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      productsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      productsCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch seller products" });
+    sendError(res, 500, "Failed to fetch seller products", e);
   }
 });
 
 app.post("/seller/products", async (req, res) => {
   try {
-    const productsCol = req.db.collection("products");
     const product = {
       ...req.body,
       sellerEmail: req.user.email,
-      sellerName: req.dbUser.name || "",
+      sellerName: req.dbUser?.name || "",
       status: "available",
       dateUploaded: new Date(),
       createdAt: new Date(),
     };
-    const result = await productsCol.insertOne(product);
+    const result = await req.db.collection("products").insertOne(product);
     res.status(201).json({ success: true, message: "Product created", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to create product" });
+    sendError(res, 500, "Failed to create product", e);
   }
 });
 
-// Ownership check — seller can only update their own product
 app.patch("/seller/products/:id", async (req, res) => {
   try {
-    const productsCol = req.db.collection("products");
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
     const filter = { _id: new ObjectId(req.params.id), sellerEmail: req.user.email };
-    const result = await productsCol.updateOne(filter, { $set: { ...req.body, updatedAt: new Date() } });
+    const result = await req.db.collection("products").updateOne(
+      filter,
+      { $set: { ...req.body, updatedAt: new Date() } },
+    );
     if (result.matchedCount === 0) {
       return res.status(404).json({ success: false, message: "Product not found or not yours" });
     }
     res.status(200).json({ success: true, message: "Product updated", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update product" });
+    sendError(res, 500, "Failed to update product", e);
   }
 });
 
-// Ownership check — seller can only delete their own product
 app.delete("/seller/products/:id", async (req, res) => {
   try {
-    const productsCol = req.db.collection("products");
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
     const filter = { _id: new ObjectId(req.params.id), sellerEmail: req.user.email };
-    const result = await productsCol.deleteOne(filter);
+    const result = await req.db.collection("products").deleteOne(filter);
     if (result.deletedCount === 0) {
       return res.status(404).json({ success: false, message: "Product not found or not yours" });
     }
     res.status(200).json({ success: true, message: "Product deleted", result: null });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to delete product" });
+    sendError(res, 500, "Failed to delete product", e);
   }
 });
-
-// --- SELLER ORDERS ---
 
 app.get("/seller/orders", async (req, res) => {
   try {
@@ -881,86 +814,76 @@ app.get("/seller/orders", async (req, res) => {
       ];
     }
 
-    const result = await ordersCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
-    const total = await ordersCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      ordersCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      ordersCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch seller orders" });
+    sendError(res, 500, "Failed to fetch seller orders", e);
   }
 });
 
 app.patch("/seller/orders/:id/status", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
     const { status } = req.body;
     if (!status) {
       return res.status(400).json({ success: false, message: "Status is required" });
     }
-    const ordersCol = req.db.collection("orders");
     const filter = { _id: new ObjectId(req.params.id), sellerEmail: req.user.email };
-    const result = await ordersCol.updateOne(filter, { $set: { orderStatus: status, updatedAt: new Date() } });
+    const result = await req.db.collection("orders").updateOne(
+      filter,
+      { $set: { orderStatus: status, updatedAt: new Date() } },
+    );
     if (result.matchedCount === 0) {
       return res.status(404).json({ success: false, message: "Order not found or not yours" });
     }
     res.status(200).json({ success: true, message: "Order status updated", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update order status" });
+    sendError(res, 500, "Failed to update order status", e);
   }
 });
 
-// --- SELLER STATS ---
-
 app.get("/seller/stats", async (req, res) => {
   try {
-    const productsCol = req.db.collection("products");
-    const ordersCol = req.db.collection("orders");
-    const paymentsCol = req.db.collection("payments");
-
-    const totalProducts = await productsCol.countDocuments({ sellerEmail: req.user.email });
-    const totalSales = await ordersCol.countDocuments({ sellerEmail: req.user.email, orderStatus: "delivered" });
-    const pendingOrders = await ordersCol.countDocuments({ sellerEmail: req.user.email, orderStatus: "pending" });
-
-    const revenueData = await paymentsCol.aggregate([
-      { $match: { sellerEmail: req.user.email, paymentStatus: "success" } },
-      { $group: { _id: null, totalRevenue: { $sum: "$amount" } } },
-    ]).toArray();
+    const [totalProducts, totalOrders, pendingOrders, revenueData] = await Promise.all([
+      req.db.collection("products").countDocuments({ sellerEmail: req.user.email }),
+      req.db.collection("orders").countDocuments({ sellerEmail: req.user.email }),
+      req.db.collection("orders").countDocuments({ sellerEmail: req.user.email, orderStatus: "pending" }),
+      req.db.collection("payments").aggregate([
+        { $match: { sellerEmail: req.user.email, paymentStatus: "success" } },
+        { $group: { _id: null, totalRevenue: { $sum: "$amount" } } },
+      ]).toArray(),
+    ]);
     const totalRevenue = revenueData.length > 0 ? revenueData[0].totalRevenue : 0;
 
     res.status(200).json({
       success: true,
-      result: { totalProducts, totalSales, totalRevenue, pendingOrders },
+      result: { totalProducts, totalOrders, totalRevenue, pendingOrders },
     });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch seller stats" });
+    sendError(res, 500, "Failed to fetch seller stats", e);
   }
 });
 
-// --- SELLER ANALYTICS ---
-
 app.get("/seller/analytics", async (req, res) => {
   try {
-    const ordersCol = req.db.collection("orders");
-    const productsCol = req.db.collection("products");
-
-    // Orders have no amount field — revenue comes from the payments collection.
-    // Joining here via $lookup on orderId would require string-to-ObjectId coercion;
-    // totalRevenue is already available via /seller/stats so we omit it here.
-    const monthlySales = await ordersCol.aggregate([
-      { $match: { sellerEmail: req.user.email } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } },
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { _id: 1 } },
-    ]).toArray();
-
-    const topProducts = await productsCol
-      .find({ sellerEmail: req.user.email })
-      .sort({ soldCount: -1 })
-      .limit(5)
-      .toArray();
+    const [monthlySales, topProducts] = await Promise.all([
+      req.db.collection("orders").aggregate([
+        { $match: { sellerEmail: req.user.email } },
+        { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, count: { $sum: 1 } } },
+        { $sort: { _id: 1 } },
+      ]).toArray(),
+      req.db.collection("products")
+        .find({ sellerEmail: req.user.email })
+        .sort({ soldCount: -1 })
+        .limit(5)
+        .toArray(),
+    ]);
 
     res.status(200).json({
       success: true,
@@ -970,17 +893,15 @@ app.get("/seller/analytics", async (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch seller analytics" });
+    sendError(res, 500, "Failed to fetch seller analytics", e);
   }
 });
 
 // ==========================================
-// BUYER PROTECTED ROUTES  (buyer | admin)
+// BUYER PROTECTED ROUTES
 // ==========================================
 
 app.use("/buyer", verifyToken, buyerGuard);
-
-// --- BUYER ORDERS ---
 
 app.get("/buyer/orders", async (req, res) => {
   try {
@@ -991,25 +912,28 @@ app.get("/buyer/orders", async (req, res) => {
     const filter = { "buyerInfo.email": req.user.email };
     if (status) filter.orderStatus = status;
 
-    const result = await ordersCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
-    const total = await ordersCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      ordersCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      ordersCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch buyer orders" });
+    sendError(res, 500, "Failed to fetch buyer orders", e);
   }
 });
 
-// Only pending orders can be cancelled
 app.patch("/buyer/orders/:id/cancel", async (req, res) => {
   try {
-    const ordersCol = req.db.collection("orders");
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
     const filter = {
       _id: new ObjectId(req.params.id),
       "buyerInfo.email": req.user.email,
       orderStatus: "pending",
     };
-    const result = await ordersCol.updateOne(filter, {
+    const result = await req.db.collection("orders").updateOne(filter, {
       $set: { orderStatus: "cancelled", updatedAt: new Date() },
     });
     if (result.matchedCount === 0) {
@@ -1017,109 +941,105 @@ app.patch("/buyer/orders/:id/cancel", async (req, res) => {
     }
     res.status(200).json({ success: true, message: "Order cancelled", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to cancel order" });
+    sendError(res, 500, "Failed to cancel order", e);
   }
 });
 
-// --- BUYER STATS ---
-
 app.get("/buyer/stats", async (req, res) => {
   try {
-    const ordersCol = req.db.collection("orders");
-    const usersCol = req.db.collection("user");
+    const [totalOrders, user, recentPurchases] = await Promise.all([
+      req.db.collection("orders").countDocuments({ "buyerInfo.email": req.user.email }),
+      req.db.collection("user").findOne({ email: req.user.email }),
+      req.db.collection("orders")
+        .find({ "buyerInfo.email": req.user.email, orderStatus: "delivered" })
+        .sort({ _id: -1 })
+        .limit(5)
+        .toArray(),
+    ]);
 
-    const totalOrders = await ordersCol.countDocuments({ "buyerInfo.email": req.user.email });
-
-    const user = await usersCol.findOne({ email: req.user.email });
     const wishlistCount = user?.wishlist?.length || 0;
-
-    const recentPurchases = await ordersCol
-      .find({ "buyerInfo.email": req.user.email, orderStatus: "delivered" })
-      .sort({ _id: -1 })
-      .limit(5)
-      .toArray();
 
     res.status(200).json({
       success: true,
       result: { totalOrders, wishlistCount, recentPurchases },
     });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch buyer stats" });
+    sendError(res, 500, "Failed to fetch buyer stats", e);
   }
 });
 
 // ==========================================
-// WISHLIST ROUTES  (any authenticated user)
+// WISHLIST ROUTES
 // ==========================================
 
 app.get("/wishlist", verifyToken, async (req, res) => {
   try {
-    const usersCol = req.db.collection("user");
-    const productsCol = req.db.collection("products");
-
-    const user = await usersCol.findOne({ email: req.user.email });
+    const user = await req.db.collection("user").findOne({ email: req.user.email });
     const wishlist = user?.wishlist || [];
 
     if (wishlist.length === 0) {
       return res.status(200).json({ success: true, result: [] });
     }
 
-    const objectIds = wishlist.map((id) => new ObjectId(id));
-    const result = await productsCol.find({ _id: { $in: objectIds } }).toArray();
+    const validIds = wishlist.filter(id => isValidObjectId(id));
+    const objectIds = validIds.map((id) => new ObjectId(id));
+    const result = await req.db.collection("products").find({ _id: { $in: objectIds } }).toArray();
 
     res.status(200).json({ success: true, result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch wishlist" });
+    sendError(res, 500, "Failed to fetch wishlist", e);
   }
 });
 
 app.post("/wishlist/:productId", verifyToken, async (req, res) => {
   try {
-    const usersCol = req.db.collection("user");
-    await usersCol.updateOne(
+    if (!isValidObjectId(req.params.productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+    await req.db.collection("user").updateOne(
       { email: req.user.email },
       { $addToSet: { wishlist: req.params.productId } },
     );
     res.status(200).json({ success: true, message: "Added to wishlist", result: null });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update wishlist" });
+    sendError(res, 500, "Failed to update wishlist", e);
   }
 });
 
 app.delete("/wishlist/:productId", verifyToken, async (req, res) => {
   try {
-    const usersCol = req.db.collection("user");
-    await usersCol.updateOne(
+    if (!isValidObjectId(req.params.productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+    await req.db.collection("user").updateOne(
       { email: req.user.email },
       { $pull: { wishlist: req.params.productId } },
     );
     res.status(200).json({ success: true, message: "Removed from wishlist", result: null });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update wishlist" });
+    sendError(res, 500, "Failed to update wishlist", e);
   }
 });
 
 // ==========================================
-// PROFILE ROUTES  (any authenticated user)
+// PROFILE ROUTES
 // ==========================================
 
 app.get("/profile", verifyToken, async (req, res) => {
   try {
-    const usersCol = req.db.collection("user");
-    const user = await usersCol.findOne({ email: req.user.email });
+    const user = await req.db.collection("user").findOne({ email: req.user.email });
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
     const { password, ...profile } = user;
     res.status(200).json({ success: true, result: profile });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch profile" });
+    sendError(res, 500, "Failed to fetch profile", e);
   }
 });
 
 app.patch("/profile", verifyToken, async (req, res) => {
   try {
-    const usersCol = req.db.collection("user");
     const { name, contact, location, image } = req.body;
     const update = { updatedAt: new Date() };
     if (name !== undefined) update.name = name;
@@ -1127,15 +1047,18 @@ app.patch("/profile", verifyToken, async (req, res) => {
     if (location !== undefined) update.location = location;
     if (image !== undefined) update.image = image;
 
-    const result = await usersCol.updateOne({ email: req.user.email }, { $set: update });
+    const result = await req.db.collection("user").updateOne(
+      { email: req.user.email },
+      { $set: update },
+    );
     res.status(200).json({ success: true, message: "Profile updated", result });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to update profile" });
+    sendError(res, 500, "Failed to update profile", e);
   }
 });
 
 // ==========================================
-// PAYMENTS ROUTES  (buyer | admin)
+// PAYMENTS ROUTES
 // ==========================================
 
 app.post("/payments/create-intent", verifyToken, buyerGuard, async (req, res) => {
@@ -1147,13 +1070,9 @@ app.post("/payments/create-intent", verifyToken, buyerGuard, async (req, res) =>
     }
 
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100), // Stripe expects amount in paisa/cents
-      currency: "bdt",                  // change to "usd" if needed
-      metadata: {
-        productId,
-        productTitle,
-        buyerEmail: req.user.email,
-      },
+      amount: Math.round(amount * 100),
+      currency: "bdt",
+      metadata: { productId, productTitle, buyerEmail: req.user.email },
     });
 
     res.status(200).json({
@@ -1161,14 +1080,10 @@ app.post("/payments/create-intent", verifyToken, buyerGuard, async (req, res) =>
       result: { clientSecret: paymentIntent.client_secret },
     });
   } catch (e) {
-    console.error("Stripe create-intent error:", e);
-    res.status(500).json({ success: false, message: "Failed to create payment intent" });
+    sendError(res, 500, "Failed to create payment intent", e);
   }
 });
 
-// POST /payments/confirm
-// Protected: buyer must be logged in
-// Body: { transactionId, productId, sellerEmail, amount, productTitle }
 app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
   try {
     const { transactionId, productId, sellerEmail, amount, productTitle } = req.body;
@@ -1177,7 +1092,10 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
       return res.status(400).json({ success: false, message: "transactionId and productId are required" });
     }
 
-    // Verify the payment intent actually succeeded with Stripe
+    if (!isValidObjectId(productId)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+
     const paymentIntent = await stripe.paymentIntents.retrieve(transactionId);
     if (paymentIntent.status !== "succeeded") {
       return res.status(400).json({ success: false, message: "Payment not confirmed by Stripe" });
@@ -1200,17 +1118,9 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
 
     const now = new Date();
 
-    // 1. Create the order
     const order = {
-      buyerInfo: {
-        userId: buyer._id.toString(),
-        name: buyer.name,
-        email: buyer.email,
-      },
-      sellerInfo: {
-        email: product.sellerEmail,
-        name: product.sellerName,
-      },
+      buyerInfo: { userId: buyer._id.toString(), name: buyer.name, email: buyer.email },
+      sellerInfo: { email: product.sellerEmail, name: product.sellerName },
       sellerEmail: product.sellerEmail,
       productId,
       productTitle: product.title,
@@ -1222,8 +1132,7 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
     };
     const orderResult = await ordersCol.insertOne(order);
 
-    // 2. Save payment record
-    const payment = {
+    await paymentsCol.insertOne({
       transactionId,
       orderId: orderResult.insertedId.toString(),
       productId,
@@ -1233,13 +1142,11 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
       paymentStatus: "success",
       paymentMethod: "stripe",
       createdAt: now,
-    };
-    await paymentsCol.insertOne(payment);
+    });
 
-    // 3. Mark product as sold (optional — remove if you allow multiple sales)
     await productsCol.updateOne(
       { _id: new ObjectId(productId) },
-      { $set: { status: "sold", updatedAt: now } }
+      { $set: { status: "sold", updatedAt: now } },
     );
 
     res.status(201).json({
@@ -1248,8 +1155,7 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
       result: { orderId: orderResult.insertedId },
     });
   } catch (e) {
-    console.error("Stripe confirm error:", e);
-    res.status(500).json({ success: false, message: "Failed to save payment" });
+    sendError(res, 500, "Failed to save payment", e);
   }
 });
 
@@ -1262,65 +1168,27 @@ app.get("/payments/my-history", verifyToken, buyerGuard, async (req, res) => {
     const filter = { buyerEmail: req.user.email };
     if (status) filter.paymentStatus = status;
 
-    const result = await paymentsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray();
-    const total = await paymentsCol.countDocuments(filter);
+    const [result, total] = await Promise.all([
+      paymentsCol.find(filter).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      paymentsCol.countDocuments(filter),
+    ]);
 
     res.status(200).json({ success: true, result, total });
   } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to fetch payment history" });
+    sendError(res, 500, "Failed to fetch payment history", e);
   }
 });
 
 // ==========================================
-// REVIEWS — PROTECTED WRITE  (buyer | admin)
+// UPLOAD ROUTES
 // ==========================================
 
-app.post("/reviews", verifyToken, buyerGuard, async (req, res) => {
-  try {
-    const { productId, rating, comment } = req.body;
-    if (!productId || rating == null) {
-      return res.status(400).json({ success: false, message: "productId and rating are required" });
-    }
-
-    const buyer = req.dbUser;
-    const reviewsCol = req.db.collection("reviews");
-
-    // One review per buyer per product
-    const existing = await reviewsCol.findOne({ productId, "reviewerInfo.userId": buyer._id.toString() });
-    if (existing) {
-      return res.status(409).json({ success: false, message: "You have already reviewed this product" });
-    }
-
-    const review = {
-      reviewerInfo: {
-        userId: buyer._id.toString(),
-        name: buyer.name,
-      },
-      productId,
-      rating: Number(rating),
-      comment: comment || "",
-      createdAt: new Date(),
-    };
-
-    const result = await reviewsCol.insertOne(review);
-    res.status(201).json({ success: true, message: "Review submitted", result });
-  } catch (e) {
-    res.status(500).json({ success: false, message: "Failed to submit review" });
-  }
-});
-
-// ==========================================
-// UPLOAD ROUTES  (any authenticated user)
-// ==========================================
-
-// POST /upload — receives raw binary body, deduplicates via SHA-256, uploads to Cloudinary
 app.post("/upload", verifyToken, async (req, res) => {
   try {
     const mimeType = req.headers["content-type"] || "image/jpeg";
     const folder = req.headers["x-upload-folder"] || "Kino.com";
     const fileName = req.headers["x-upload-filename"] || "upload";
 
-    // Collect raw binary stream — works because express.json() ignores non-JSON content-types
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const buffer = Buffer.concat(chunks);
@@ -1329,7 +1197,6 @@ app.post("/upload", verifyToken, async (req, res) => {
       return res.status(400).json({ success: false, message: "No file data received" });
     }
 
-    // SHA-256 deduplication check
     const hash = crypto.createHash("sha256").update(buffer).digest("hex");
     const uploadsCol = req.db.collection("cloudinary_uploads");
 
@@ -1341,7 +1208,6 @@ app.post("/upload", verifyToken, async (req, res) => {
       });
     }
 
-    // Upload to Cloudinary as base64 data URI
     const dataUri = `data:${mimeType};base64,${buffer.toString("base64")}`;
     const result = await cloudinary.uploader.upload(dataUri, {
       folder,
@@ -1353,7 +1219,6 @@ app.post("/upload", verifyToken, async (req, res) => {
       ],
     });
 
-    // Persist upload record for deduplication and ownership tracking
     try {
       await uploadsCol.insertOne({
         hash,
@@ -1368,7 +1233,6 @@ app.post("/upload", verifyToken, async (req, res) => {
       });
     } catch (e) {
       if (e.code === 11000) {
-        // Race condition: another identical upload completed first
         const winner = await uploadsCol.findOne({ hash });
         return res.status(200).json({
           success: true,
@@ -1383,12 +1247,10 @@ app.post("/upload", verifyToken, async (req, res) => {
       result: { url: result.secure_url, public_id: result.public_id, isDuplicate: false },
     });
   } catch (e) {
-    console.error("Upload error:", e);
-    return res.status(500).json({ success: false, message: "Upload failed" });
+    sendError(res, 500, "Upload failed", e);
   }
 });
 
-// DELETE /upload/*publicId — publicId may contain slashes (e.g. Kino.com/products/abc123)
 app.delete("/upload/*publicId", verifyToken, async (req, res) => {
   try {
     const publicId = req.params.publicId;
@@ -1407,8 +1269,7 @@ app.delete("/upload/*publicId", verifyToken, async (req, res) => {
 
     return res.status(200).json({ success: true, message: "Image deleted" });
   } catch (e) {
-    console.error("Delete error:", e);
-    return res.status(500).json({ success: false, message: "Delete failed" });
+    sendError(res, 500, "Delete failed", e);
   }
 });
 
@@ -1418,7 +1279,7 @@ app.delete("/upload/*publicId", verifyToken, async (req, res) => {
 
 if (process.env.NODE_ENV !== "production") {
   app.listen(port, async () => {
-    await connectToDB(); // Ensure DB connects before accepting requests
+    await connectToDB();
     console.log(`Server is running at port:${port}`);
   });
 }
