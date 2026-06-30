@@ -623,7 +623,7 @@ app.get("/admin/analytics", async (req, res) => {
       ]).toArray(),
       paymentsCol.aggregate([
         { $match: { paymentStatus: "success" } },
-        { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, revenue: { $sum: "$amount" } } },
+        { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, revenue: { $sum: "$amount" } } },
         { $sort: { _id: 1 } },
       ]).toArray(),
     ]);
@@ -753,7 +753,7 @@ app.post("/seller/products", async (req, res) => {
       ...req.body,
       sellerEmail: req.user.email,
       sellerName: req.dbUser?.name || "",
-      status: "available",
+      status: "pending",
       dateUploaded: new Date(),
       createdAt: new Date(),
     };
@@ -1119,12 +1119,17 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
 
     const now = new Date();
 
+    const resolvedSellerEmail = product.sellerInfo?.email || product.sellerEmail || "";
+    const resolvedSellerName  = product.sellerInfo?.name  || product.sellerName  || "";
+    const resolvedSellerPhone = product.sellerInfo?.phone || "";
+
     const order = {
       buyerInfo: { userId: buyer._id.toString(), name: buyer.name, email: buyer.email },
-      sellerInfo: { email: product.sellerEmail, name: product.sellerName },
-      sellerEmail: product.sellerEmail,
+      sellerInfo: { email: resolvedSellerEmail, name: resolvedSellerName, phone: resolvedSellerPhone },
+      sellerEmail: resolvedSellerEmail,
       productId,
       productTitle: product.title,
+      transactionId,
       totalAmount: amount,
       orderStatus: "pending",
       paymentStatus: "paid",
@@ -1138,7 +1143,7 @@ app.post("/payments/confirm", verifyToken, buyerGuard, async (req, res) => {
       orderId: orderResult.insertedId.toString(),
       productId,
       buyerEmail: buyer.email,
-      sellerEmail: product.sellerEmail,
+      sellerEmail: resolvedSellerEmail,
       amount,
       paymentStatus: "success",
       paymentMethod: "stripe",
