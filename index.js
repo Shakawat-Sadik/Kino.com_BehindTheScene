@@ -1040,12 +1040,13 @@ app.get("/profile", verifyToken, async (req, res) => {
 
 app.patch("/profile", verifyToken, async (req, res) => {
   try {
-    const { name, contact, location, image } = req.body;
+    const { name, contact, location, image, role } = req.body;
     const update = { updatedAt: new Date() };
     if (name !== undefined) update.name = name;
     if (contact !== undefined) update.contact = contact;
     if (location !== undefined) update.location = location;
     if (image !== undefined) update.image = image;
+    if (role !== undefined && ["buyer", "seller"].includes(role)) update.role = role;
 
     const result = await req.db.collection("user").updateOne(
       { email: req.user.email },
