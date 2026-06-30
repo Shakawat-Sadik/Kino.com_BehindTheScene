@@ -1071,7 +1071,7 @@ app.post("/payments/create-intent", verifyToken, buyerGuard, async (req, res) =>
     }
 
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100),
+      amount: Math.round(amount),
       currency: "gbp",
       metadata: { productId, productTitle, buyerEmail: req.user.email },
     });
