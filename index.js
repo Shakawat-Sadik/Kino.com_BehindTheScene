@@ -21,10 +21,7 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 const uri = process.env.MONGODB_URI;
-const url =
-  process.env.NODE_ENV === "production"
-    ? process.env.CLIENT_URL
-    : "http://localhost:3000";
+const url = process.env.CLIENT_URL || "http://localhost:3000";
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -142,11 +139,8 @@ const adminGuard = async (req, res, next) => {
     if (!req.user?.email) {
       return res.status(401).json({ success: false, message: "Not authenticated" });
     }
-    const user = await req.db.collection("user").findOne({
-      email: req.user.email,
-      role: "admin",
-    });
-    if (!user) {
+    const user = await req.db.collection("user").findOne({ email: req.user.email });
+    if (!user || user.role?.toLowerCase() !== "admin") {
       return res.status(403).json({ success: false, message: "Forbidden: Admins only" });
     }
     req.dbUser = user;
@@ -749,10 +743,16 @@ app.get("/seller/products", async (req, res) => {
 
 app.post("/seller/products", async (req, res) => {
   try {
+    const { title, category, condition, price, description, images, location } = req.body;
     const product = {
-      ...req.body,
+      title, category, condition, price: Number(price), description, images, location,
       sellerEmail: req.user.email,
       sellerName: req.dbUser?.name || "",
+      sellerInfo: {
+        email: req.user.email,
+        name: req.dbUser?.name || "",
+        phone: req.dbUser?.contact ? String(req.dbUser.contact) : "",
+      },
       status: "pending",
       dateUploaded: new Date(),
       createdAt: new Date(),
@@ -770,10 +770,15 @@ app.patch("/seller/products/:id", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid product ID" });
     }
     const filter = { _id: new ObjectId(req.params.id), sellerEmail: req.user.email };
-    const result = await req.db.collection("products").updateOne(
-      filter,
-      { $set: { ...req.body, updatedAt: new Date() } },
-    );
+    const { title, category, condition, price, description, images } = req.body;
+    const update = { updatedAt: new Date() };
+    if (title !== undefined) update.title = title;
+    if (category !== undefined) update.category = category;
+    if (condition !== undefined) update.condition = condition;
+    if (price !== undefined) update.price = Number(price);
+    if (description !== undefined) update.description = description;
+    if (images !== undefined) update.images = images;
+    const result = await req.db.collection("products").updateOne(filter, { $set: update });
     if (result.matchedCount === 0) {
       return res.status(404).json({ success: false, message: "Product not found or not yours" });
     }
