@@ -127,7 +127,8 @@ const verifyToken = async (req, res, next) => {
       req.user = payload;
       next();
     } catch (e) {
-      return res.status(403).json({ success: false, message: "Invalid or expired token" });
+      console.error("[verifyToken] jose error:", e.code, e.message);
+      return res.status(403).json({ success: false, message: "Invalid or expired token", debug: e.code });
     }
   } catch (e) {
     return res.status(401).json({ success: false, message: "Authentication error" });
